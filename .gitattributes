@@ -1,0 +1,20 @@
+* text=auto
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.bin binary
+*.epro binary
+*.epro2 binary
+*.step binary
+*.stp binary
+*.xlsx binary
+*.png binary
+*.jpg binary
+*.pdf binary

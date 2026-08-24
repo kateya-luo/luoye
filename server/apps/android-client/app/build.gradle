@@ -1,0 +1,14 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'chat.clearmeeting.app'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'chat.clearmeeting.app'
+        minSdk 26
+        targetSdk 36
+        versionCode 6
+        versionName '0.6.0'
+    }
+}

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>配置 Clear Meeting</title>
+  <link rel="stylesheet" href="setup.css">
+</head>
+<body>
+  <div class="titlebar">
+    <div class="brand"><span class="mark">C</span><span>CLEAR MEETING</span></div>
+    <div class="win-ctrls">
+      <button id="min" title="最小化"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+      <button id="max" title="最大化"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></svg></button>
+      <button id="close" class="close" title="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+  </div>
+  <main>
+    <div class="card">
+      <div class="logo"><span class="mark big">C</span><b>CLEAR MEETING</b></div>
+      <p class="tagline">让每一次会议更高效、更清晰</p>
+      <h1>连接你的会议服务器</h1>
+      <p class="desc">推荐填写 Tailscale 私网地址，例如 <code>http://100.64.0.10</code>。地址仅保存在本机。</p>
+      <form id="setup">
+        <label>云服务器地址</label>
+        <div class="input">
+          <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="1.5"/><rect x="4" y="14" width="16" height="6" rx="1.5"/><path d="M8 7h.01M8 17h.01"/></svg>
+          <input id="server" placeholder="http://100.x.x.x" autocomplete="url" required autofocus>
+        </div>
+        <button type="submit">保存并进入</button>
+        <div id="error"></div>
+      </form>
+      <small class="note">下一步将进入登录页，使用部署时设置的访问密码登录。</small>
+    </div>
+  </main>
+  <script src="setup.js"></script>
+</body>
+</html>

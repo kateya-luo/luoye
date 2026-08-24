@@ -1,0 +1,29 @@
+# 依赖与构建产物
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+apps/desktop-client/native/publish/
+apps/desktop-client/native/**/bin/
+apps/desktop-client/native/**/obj/
+apps/desktop-client/app/client/
+apps/android-client/.gradle/
+apps/android-client/build/
+apps/android-client/app/build/
+apps/android-client/local.properties
+firmware/recorder-card/build/
+firmware/recorder-card/sdkconfig
+firmware/recorder-card/tools/*.exe
+firmware/recorder-card/tools/*.obj
+
+# 运行时数据与密钥（绝不入库）
+deploy/.env
+server/data/
+*.db
+*.pcm
+
+# 编辑器
+.vscode/
+.idea/
+.pytest_cache/

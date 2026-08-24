@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.pyc
+node_modules
+**/node_modules
+apps/web-client/dist
+server/data/audio_cache/*
+server/data/transcripts/*
+server/data/summaries/*
+outputs
+work

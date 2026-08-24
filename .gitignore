@@ -1,0 +1,62 @@
+# Local GitHub release payloads (upload with the GitHub UI/CLI, never commit)
+.github-release-assets/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.nvs.bin
+
+# Runtime data and user recordings
+**/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pcm
+*.wav
+*.mp3
+*.m4a
+*.log
+
+# Dependencies and generated output
+**/node_modules/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.py[cod]
+**/dist/
+**/build/
+**/build-*/
+**/managed_components/
+**/releases/
+**/bin/
+**/obj/
+**/publish/
+firmware/sdkconfig.old
+firmware/tools/*.exe
+firmware/tools/*.obj
+firmware/tools/*.o
+firmware/tools/*.pdb
+firmware/screens_preview.png
+
+# Archives are GitHub Release assets, not source files
+*.zip
+*.rar
+*.7z
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

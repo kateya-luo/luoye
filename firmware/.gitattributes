@@ -1,0 +1,17 @@
+* text=auto
+
+*.c text eol=lf
+*.h text eol=lf
+*.in text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.csv text eol=lf
+*.defaults text eol=lf
+sdkconfig text eol=lf
+sdkconfig.* text eol=lf
+
+*.bat text eol=crlf
+*.bin binary
+*.exe binary
+*.obj binary

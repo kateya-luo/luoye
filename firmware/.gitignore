@@ -1,0 +1,43 @@
+# ESP-IDF generated build trees
+build/
+build-*/
+
+# Generated sdkconfig backups and dependency cache
+sdkconfig.old
+sdkconfig.dev
+sdkconfig.rc
+sdkconfig.release
+managed_components/
+
+# Host-side test outputs
+tools/*.exe
+tools/*.obj
+tools/*.o
+tools/*.pdb
+screens_preview.png
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Release artifacts are reproducible and archived outside Git.
+releases/
+
+# Local credentials and manufacturing data
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.nvs.bin
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

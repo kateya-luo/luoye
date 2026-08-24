@@ -1,0 +1,6 @@
+# 16MB Flash。assets 分区预留给中文点阵字库/开机图(v2);OTA 后续再切双 app 分区
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   24K
+phy_init,   data, phy,      0xf000,   4K
+factory,    app,  factory,  0x10000,  6M
+assets,     data, spiffs,   ,         8M

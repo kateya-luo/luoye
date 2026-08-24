@@ -1,0 +1,36 @@
+{
+  "name": "@ai-recorder/desktop-client",
+  "version": "0.20.0",
+  "private": true,
+  "description": "Clear Meeting Electron desktop client",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "build:ui": "npm --workspace @ai-recorder/web-client run build && node scripts/copy-web-ui.cjs",
+    "build:ble-agent": "dotnet publish native/ClearMeeting.BleAgent/ClearMeeting.BleAgent.csproj -c Release -r win-x64 -o native/publish/ble-agent",
+    "pack:win": "npm run build:ui && npm run build:ble-agent && electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "42.4.1",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "chat.clearmeeting.desktop",
+    "productName": "Clear Meeting",
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "ble-agent.cjs",
+      "app/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "native/publish/ble-agent",
+        "to": "ble-agent"
+      }
+    ],
+    "win": {
+      "target": "portable"
+    }
+  }
+}

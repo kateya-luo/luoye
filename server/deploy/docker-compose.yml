@@ -1,0 +1,165 @@
+name: ai-recorder-system
+
+services:
+  funasr:
+    profiles: ["real-asr"]
+    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+    privileged: true
+    command:
+      - bash
+      - -lc
+      - >-
+        cd /workspace/FunASR/runtime &&
+        sed -i 's/max_single_segment_time: [0-9]*/max_single_segment_time: 12000/' /workspace/models/iic/speech_fsmn_vad_zh-cn-16k-common-onnx/config.yaml /workspace/models/damo/speech_fsmn_vad_zh-cn-16k-common-onnx/config.yaml 2>/dev/null || true ;
+        bash run_server_2pass.sh --download-model-dir /workspace/models --certfile 0;
+        sleep 20 ;
+        while pgrep -f '[f]unasr-wss-server' >/dev/null; do sleep 10; done
+    # ↑ VAD 单段最长时长压到 12s（连续讲课也每12秒断一次干净整句，实时翻译才能流畅，见 ROADMAP §5.1）。
+    #   sed 放在启动前：现有安装立即生效；全新安装首次下载模型时 config 尚不存在(||true 跳过)，
+    #   模型下完后 docker compose restart funasr 一次即修。改动落在模型卷、持久，但重下模型会被覆盖——故固化在此。
+    # ↑ 同 funasr-offline 的自愈：实时 wss-server-2pass 被 OOM 杀掉后，容器随之退出→
+    #   restart 策略自动重启重载模型。绝不能用 tail -f /dev/null（服务死了容器仍假装 Up，
+    #   现场字幕全停却永不自动恢复）。pgrep 用方括号防止匹配到监视循环自身。
+    volumes:
+      - ${FUNASR_MODELS_DIR:-../../funasr-runtime-resources/models}:/workspace/models
+    expose:
+      - "10095"
+    cpus: 2.25
+    # 复用模式（默认）下，这个在线服务同时负责实时字幕 + 断网补洞的整段重转，
+    # 内存需求更高；CPU 和内存上限在双设备并发测试后分别提升 50%/1GiB。
+    mem_limit: 6g
+    memswap_limit: 9g
+    restart: unless-stopped
+
+  # 纯 CPU 离线专用实例：把 5 分钟补传切片与实时字幕隔离，避免长录音抢占在线 ASR。
+  # 16 GiB / 8 核主机可启用：--profile offline-asr-cpu；不启用时 server 仍可复用 funasr。
+  funasr-offline-cpu:
+    profiles: ["offline-asr-cpu"]
+    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+    privileged: true
+    command:
+      - bash
+      - -lc
+      - >-
+        cd /workspace/FunASR/runtime &&
+        bash run_server_2pass.sh --download-model-dir /workspace/models --certfile 0;
+        sleep 20 ;
+        while pgrep -f '[f]unasr-wss-server' >/dev/null; do sleep 10; done
+    volumes:
+      - ${FUNASR_MODELS_DIR:-../../funasr-runtime-resources/models}:/workspace/models
+    expose:
+      - "10095"
+    cpus: 2.5
+    mem_limit: 5g
+    memswap_limit: 7g
+    restart: unless-stopped
+
+  # 【可选】专用 GPU 离线转写服务。当前稳定部署不用它——优先使用上面的 CPU 隔离实例。
+  # （.env 里 FUNASR_OFFLINE_WS_URL/OFFLINE_ASR_MODE 保持注释即走默认 ws://funasr + 2pass）。
+  # 只有想要更高离线精度、且有富余显卡+内存时，才启用本服务并在 .env 里显式指向它。
+  # 离线转写服务（设计文档 §6 / P5）。GPU 加速（GTX 1060 3GB）。
+  # profile 隔离：启用 → docker compose --profile offline-asr up -d funasr-offline
+  # 首次启动会下载离线模型(paraformer-large+vad+punc+itn，数GB)，耐心等。
+  funasr-offline:
+    profiles: ["offline-asr"]
+    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-gpu-0.2.1
+    runtime: nvidia
+    privileged: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # 3GB 显存：减少碎片，避免导出/推理 OOM
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+    command:
+      - bash
+      - -lc
+      - >-
+        cd /workspace/FunASR/runtime &&
+        bash run_server.sh
+        --download-model-dir /workspace/models
+        --model-dir iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+        --vad-dir iic/speech_fsmn_vad_zh-cn-16k-common-onnx
+        --punc-dir iic/punc_ct-transformer_cn-en-common-vocab471067-large-onnx
+        --itn-dir thuduj12/fst_itn_zh
+        --certfile 0
+        --bladedisc false
+        --batch-size 1
+        --decoder-thread-num 1 ;
+        sleep 20 ;
+        while pgrep -f '[f]unasr-wss-server' >/dev/null; do sleep 10; done
+    # ↑ 自愈：内部 wss-server 一旦死掉（如主机 OOM 被杀），循环退出→容器退出→
+    #   restart 策略自动重启并重载模型。绝不能用 tail -f /dev/null（会把内部崩溃掩盖成 Up）。
+    #   pgrep 模式必须写成 '[f]unasr...'：否则会匹配到跑这个 while 的 bash 自身
+    #   （它的命令行里也有 funasr-wss-server 字样），服务真死了循环也不退出，白做自愈。
+    volumes:
+      - ${FUNASR_MODELS_DIR:-../../funasr-runtime-resources/models}:/workspace/models
+    expose:
+      - "10095"
+    mem_limit: 6g
+    restart: unless-stopped
+
+  # 说话人分离服务（CAM++ 声纹嵌入）。server 侧需 .env 设 SPEAKER_MODE=remote 才启用。
+  # 首次启动会下载声纹模型（数百 MB）。
+  speaker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.speaker
+    volumes:
+      - ${FUNASR_MODELS_DIR:-../../funasr-runtime-resources/models}:/workspace/models
+    expose:
+      - "10100"
+    cpus: 1.5
+    mem_limit: 3g
+    memswap_limit: 5g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10100/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ../server/data:/app/data
+    expose:
+      - "8000"
+    depends_on:
+      speaker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.nginx
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:80:80"
+      # HTTPS 启用后取消下一行注释，并在 nginx.conf 中启用 443 server 块。
+      # - "443:443"
+    # HTTPS 启用后取消以下挂载，并确保宿主机证书路径存在。
+    # volumes:
+    #   - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

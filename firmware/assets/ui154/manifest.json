@@ -1,0 +1,150 @@
+{
+  "format": "luoye-ui154-1bpp-v1",
+  "width": 200,
+  "height": 200,
+  "stride": 25,
+  "black_bit": 1,
+  "threshold": 144,
+  "layout_file": "luoye_ui_layout_23pages_with_icons.json",
+  "layout_sha256": "b477d3d906d10640a0257c4034df567bd58f6f9f1f60f4e3eb6ccdc040ff4cfa",
+  "pages": [
+    {
+      "id": "01_home",
+      "source": "01_home.png",
+      "bytes": 5000,
+      "sha256": "ab7a2c87f8ff3f634c146791ad6fcb7f83486d7032003504e526b53e5d82ace1"
+    },
+    {
+      "id": "02_agenda",
+      "source": "02_agenda.png",
+      "bytes": 5000,
+      "sha256": "fcd1cebd1c61cf20928142519439771d2e07d31a97ef4cc01a2f482c9586d315"
+    },
+    {
+      "id": "03_device_status",
+      "source": "03_device_status.png",
+      "bytes": 5000,
+      "sha256": "d64030c06d9ac3106fbed5b1d06a88d6ea92cd65bcca536be72cb25d86c318c5"
+    },
+    {
+      "id": "04_meeting_prepare",
+      "source": "04_meeting_prepare.png",
+      "bytes": 5000,
+      "sha256": "c543dd660b38666a85de310fed357f6f61babb798a9d4420abc026f8a0599c1c"
+    },
+    {
+      "id": "05_meeting_caption",
+      "source": "05_meeting_caption.png",
+      "bytes": 5000,
+      "sha256": "a131ef0c3e1cca520c801f5a6c947fd05e8073f33c585196c77d3d468c426d64"
+    },
+    {
+      "id": "06_meeting_status",
+      "source": "06_meeting_status.png",
+      "bytes": 5000,
+      "sha256": "977837c59a327ec07d4f29fcf5fa094a3292592b3d5f3035cdf5f33132b3f0da"
+    },
+    {
+      "id": "07_meeting_paused",
+      "source": "07_meeting_paused.png",
+      "bytes": 5000,
+      "sha256": "324efbec987e7c8adef1f0fdd0a8dcf150012a20b4a35012e772f528d137a3f6"
+    },
+    {
+      "id": "08_meeting_locked",
+      "source": "08_meeting_locked.png",
+      "bytes": 5000,
+      "sha256": "20eaea197c63d2988bf7dc19ab6fae5db8038f7e20030a59afa57da0442c17c6"
+    },
+    {
+      "id": "09_meeting_saving",
+      "source": "09_meeting_saving.png",
+      "bytes": 5000,
+      "sha256": "2c80dbabde9ec795c0652428039b8f8e669b69534c4f80f0bf71d92bfd1a7e30"
+    },
+    {
+      "id": "10_todo_listening",
+      "source": "10_todo_listening.png",
+      "bytes": 5000,
+      "sha256": "3a45f582c0551115f041e088f3b04d75dab1c9265c72e483c9192864f14f2bf2"
+    },
+    {
+      "id": "11_todo_confirm",
+      "source": "11_todo_confirm.png",
+      "bytes": 5000,
+      "sha256": "102997dc9b3126eb91e4c735cd7b163b507a96abc738118d136656e9f5745b3e"
+    },
+    {
+      "id": "12_todo_created",
+      "source": "12_todo_created.png",
+      "bytes": 5000,
+      "sha256": "5c288b4f8038528cb908a1e5fdcec90cb19204f2da21518ba8a3902e21335dd1"
+    },
+    {
+      "id": "13_schedule_reminder",
+      "source": "13_schedule_reminder.png",
+      "bytes": 5000,
+      "sha256": "11392182f291c1578823d8cb649284d2d710d718e9bff4522f63b9552d96574c"
+    },
+    {
+      "id": "14_reminder_alt",
+      "source": "14_reminder_alt.png",
+      "bytes": 5000,
+      "sha256": "11392182f291c1578823d8cb649284d2d710d718e9bff4522f63b9552d96574c"
+    },
+    {
+      "id": "15_pair_hotspot",
+      "source": "15_pair_hotspot.png",
+      "bytes": 5000,
+      "sha256": "a1c9b721d9e735f0fa15865dc1831c0eb800b03d3c58745e1668d00631813faa"
+    },
+    {
+      "id": "16_wifi_connect",
+      "source": "16_wifi_connect.png",
+      "bytes": 5000,
+      "sha256": "58d79a3f8bccb95fbfb7d7b663fd5a4666d0a4644cb776f9b0eb5aeea870a858"
+    },
+    {
+      "id": "17_network_ok",
+      "source": "17_network_ok.png",
+      "bytes": 5000,
+      "sha256": "d4018f154848269a6fd1f2296ee67745c0130a741b0044bd78b5f02c4139915d"
+    },
+    {
+      "id": "18_bind_code",
+      "source": "18_bind_code.png",
+      "bytes": 5000,
+      "sha256": "596086914bc8bf41cc809df66ae79fc2755a96b591bb5c95a38493b3a639e608"
+    },
+    {
+      "id": "19_bind_ok",
+      "source": "19_bind_ok.png",
+      "bytes": 5000,
+      "sha256": "53bd3e2f6bcc57d3babba8f0e0edab850bb64022459c3f469ba90141427eb73d"
+    },
+    {
+      "id": "20_charging",
+      "source": "20_charging.png",
+      "bytes": 5000,
+      "sha256": "850f318755095425d0bd1479e4db6c2a8af6f1d609eb7de9681660e7ee0adfda"
+    },
+    {
+      "id": "21_low_battery",
+      "source": "21_low_battery.png",
+      "bytes": 5000,
+      "sha256": "4e2dedd959dcc53ab6f21c80680a053e123af38ed3a46199e7c2784c42be96bf"
+    },
+    {
+      "id": "22_storage_error",
+      "source": "22_storage_error.png",
+      "bytes": 5000,
+      "sha256": "98ef0394d29de8a08a2c88d5323c8e8df56b1803506ca155620ada3938bf4f3c"
+    },
+    {
+      "id": "23_chapter_summary",
+      "source": "23_chapter_summary.png",
+      "bytes": 5000,
+      "sha256": "6cec57afc059c7d96e323917aa0a911e145d4c0999af00a00f73d845816c78ae"
+    }
+  ]
+}

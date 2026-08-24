@@ -1,0 +1,11 @@
+{
+  "name": "ai-recorder-system",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev:web": "npm --workspace @ai-recorder/web-client run dev",
+    "build:web": "npm --workspace @ai-recorder/web-client run build",
+    "dev:desktop": "npm --workspace @ai-recorder/desktop-client start",
+    "build:desktop": "npm --workspace @ai-recorder/desktop-client run pack:win"
+  }
+}

@@ -1,0 +1,5 @@
+FROM registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+COPY server/speaker_service.py /opt/clearmeeting/speaker_service.py
+ENV SPEAKER_PORT=10100 MODELSCOPE_CACHE=/workspace/models
+EXPOSE 10100
+CMD ["python", "/opt/clearmeeting/speaker_service.py"]
