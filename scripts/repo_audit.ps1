@@ -19,7 +19,10 @@ if (Test-Path -LiteralPath $gitDirectory) {
         throw 'git ls-files failed'
     }
     $files = @($candidatePaths | ForEach-Object {
-        Get-Item -LiteralPath (Join-Path $rootPath $_)
+        $candidate = Join-Path $rootPath $_
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            Get-Item -LiteralPath $candidate
+        }
     } | Where-Object { -not $_.PSIsContainer })
 }
 else {

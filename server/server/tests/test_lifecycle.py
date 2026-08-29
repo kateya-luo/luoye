@@ -46,6 +46,9 @@ class FakeStorage:
     def set_state(self, sid, state):
         self.states[sid] = state
 
+    def set_audio_end(self, sid, end_ms):
+        pass
+
 
 def make():
     sessions, coverage, queue = FakeSessions(), CoverageTracker(), FakeQueue()
@@ -100,7 +103,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(queue.jobs, [])
         # final=1 到达：残余洞 + summarize 哨兵按序入队
         asyncio.run(lc.on_audio_complete("m1", 60000))
-        self.assertEqual(queue.jobs, [("m1", 15000, 25000, "gap"), ("m1", 0, 0, "summarize")])
+        self.assertEqual(queue.jobs, [("m1", 15000, 25000, "gap"), ("m1", 0, 0, "publish")])
         # 哨兵取回 finalizing 会话并清理状态
         self.assertIs(lc.pop_finalizing("m1"), s)
         self.assertNotIn("m1", lc.audio_complete)
@@ -110,7 +113,17 @@ class LifecycleTest(unittest.TestCase):
         s = FakeSession("m1")
         asyncio.run(lc.on_audio_complete("m1", 60000))
         asyncio.run(lc.defer_finalize("m1", s))
-        self.assertEqual(queue.jobs, [("m1", 0, 0, "summarize")])
+        self.assertEqual(queue.jobs, [("m1", 0, 0, "publish")])
+
+    def test_browser_finish_runs_canonical_before_publish(self):
+        sessions, coverage, queue, lc = make()
+        s = FakeSession("m1")
+        asyncio.run(lc.on_audio_complete("m1", 60000))
+        asyncio.run(lc.defer_finalize("m1", s, canonical=True))
+        self.assertEqual(queue.jobs, [
+            ("m1", 0, 0, "canonical"),
+            ("m1", 0, 0, "publish"),
+        ])
 
     def test_wait_audio_complete(self):
         sessions, coverage, queue, lc = make()
@@ -132,7 +145,7 @@ class LifecycleTest(unittest.TestCase):
         asyncio.run(lc.on_upload_progress("m1"))
         self.assertEqual(queue.jobs, [
             ("m1", 10000, 20000, "gap"),
-            ("m1", 0, 0, "summarize"),
+            ("m1", 0, 0, "publish"),
         ])
         self.assertNotIn("m1", lc.recovering_gaps)
 

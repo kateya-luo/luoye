@@ -1,13 +1,10 @@
 import hashlib
 import importlib
-import asyncio
 import os
 import tempfile
-import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 os.environ.setdefault("ASR_MODE", "mock")
 
@@ -18,8 +15,7 @@ from fastapi.testclient import TestClient
 from app import auth
 from app.agenda import AgendaStore, create_agenda_router
 from app.device_api_v1 import (MAX_CHUNK_BYTES, MAX_TODO_BYTES,
-                               RANGE_BLOCK_BYTES, DeviceLiveRuntime,
-                               create_device_v2_router)
+                               RANGE_BLOCK_BYTES, create_device_v2_router)
 from app.storage import Storage
 
 
@@ -51,7 +47,7 @@ class DeviceV1Test(unittest.TestCase):
                 else {"detail": exc.detail}
             return JSONResponse(status_code=exc.status_code, content=content)
 
-        self.client = self.enterContext(TestClient(app))
+        self.client = TestClient(app)
         self.client.headers.update({
             "X-Luoye-Protocol": "luoye-device-api/2",
             "X-Luoye-Firmware": "0.6.1",
@@ -61,8 +57,6 @@ class DeviceV1Test(unittest.TestCase):
         self.token2 = self._login("TEST2")
 
     def tearDown(self):
-        if getattr(self.client, "portal", None) is not None:
-            self.client.portal.call(self.router.device_service.shutdown)
         self.storage.db.close()
         importlib.reload(auth)
 
@@ -97,7 +91,7 @@ class DeviceV1Test(unittest.TestCase):
 
     def test_build_info_contract(self):
         body = self.client.get("/api/v2/build-info").json()
-        self.assertEqual(body["server_version"], "1.0.1")
+        self.assertEqual(body["server_version"], "0.21.0")
         self.assertEqual(body["protocol_version"], "luoye-device-api/2")
         self.assertEqual(body["device_auth_profile"], "engineering")
         self.assertIn("idempotent_upload", body["capabilities"])
@@ -105,15 +99,15 @@ class DeviceV1Test(unittest.TestCase):
         self.assertIn("bulk_upload_10mib", body["capabilities"])
         self.assertIn("live_epoch_resume", body["capabilities"])
         self.assertIn("independent_sd_delete", body["capabilities"])
-        self.assertIn("device_rolling_minutes", body["capabilities"])
+        self.assertNotIn("device_rolling_minutes", body["capabilities"])
+        self.assertIn("transcript_only_live_v1", body["capabilities"])
+        self.assertIn("template_minutes_v1", body["capabilities"])
+        self.assertIn("meeting_memory_v1", body["capabilities"])
         self.assertIn("semantic_timeline_v2", body["capabilities"])
         self.assertIn("semantic_timeline_v3_anchored", body["capabilities"])
         self.assertIn("speaker_backend_readiness", body["capabilities"])
         self.assertIn("offline_asr_pipeline_v1", body["capabilities"])
-        self.assertIn("device_live_partial_caption_v1", body["capabilities"])
-        self.assertIn("device_live_partial_caption_v2", body["capabilities"])
-        self.assertIn("device_caption_upsert_v1", body["capabilities"])
-        self.assertIn("device_revision_channels_v1", body["capabilities"])
+        self.assertIn("canonical_offline_diarization_v2", body["capabilities"])
         self.assertEqual(RANGE_BLOCK_BYTES, 10 * 1024 * 1024)
 
     def test_reconnect_starts_new_live_epoch_and_gap_waits_for_manual_repair(self):
@@ -640,14 +634,12 @@ class DeviceV1Test(unittest.TestCase):
             "start": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "source": "manual"})
 
-        self.client.portal.call(self.router.device_service.shutdown)
         self.storage.db.close()
         self.storage = Storage(Path(self.temp))
         auth.configure_auth(self.storage)
         restarted_app = FastAPI()
-        restarted_router = create_device_v2_router(self.storage)
-        restarted_app.include_router(restarted_router)
-        restarted = self.enterContext(TestClient(restarted_app))
+        restarted_app.include_router(create_device_v2_router(self.storage))
+        restarted = TestClient(restarted_app)
         restarted.headers.update({
             "X-Luoye-Protocol": "luoye-device-api/2",
             "X-Luoye-Firmware": "0.6.1",
@@ -777,9 +769,9 @@ class DeviceV1Test(unittest.TestCase):
             f"/api/v2/device/sessions/{sid}/state?after_revision=0", headers=device)
         self.assertLessEqual(len(bounded.content), 8191)
         bounded_body = bounded.json()
-        self.assertTrue(all(len(item["text"].encode("utf-8")) <= 512
+        self.assertTrue(all(len(item["text"].encode("utf-8")) <= 255
                             for item in bounded_body["captions"]))
-        self.assertTrue(all(len(item["translated_text"].encode("utf-8")) <= 512
+        self.assertTrue(all(len(item["translated_text"].encode("utf-8")) <= 383
                             for item in bounded_body["translations"]))
         end = self.client.post(f"/api/v2/device/sessions/{sid}/end", headers=device | {
             "Idempotency-Key": "session:live-1:end"}, json={
@@ -801,256 +793,6 @@ class DeviceV1Test(unittest.TestCase):
         self.assertEqual((terminal["upload"]["received_chunks"],
                           terminal["upload"]["received_samples"],
                           terminal["upload"]["acknowledged_bytes"]), (4, 640, 1280))
-
-    def test_partial_caption_cursor_correction_final_isolation_and_restart(self):
-        bound = self._bind()
-        device = {"Authorization": f"Bearer {bound['device_token']}"}
-
-        def create(local_id):
-            response = self.client.post("/api/v2/device/sessions", headers=device | {
-                "Idempotency-Key": f"session:{local_id}:create"}, json={
-                    "client_session_id": local_id, "binding_generation": 1,
-                    "audio": {"codec": "pcm_s16le", "sample_rate": 16000,
-                              "channels": 1, "bits_per_sample": 16}})
-            self.assertEqual(response.status_code, 200, response.text)
-            return response.json()["server_session_id"]
-
-        first = create("partial-first")
-        second = create("partial-second")
-        service = self.router.device_service
-        first_revision = service._store_live_partial(
-            first, text="现在我们讨论一下上传速度", start_sample=1600, end_sample=3200)
-
-        legacy = self.client.get(
-            f"/api/v2/device/sessions/{first}/state?after_revision=0", headers=device).json()
-        self.assertNotIn("partial", legacy)
-        self.assertNotIn("display_revision", legacy)
-
-        current = self.client.get(
-            f"/api/v2/device/sessions/{first}/state?after_revision=0&include_partial=1"
-            "&after_display_revision=0", headers=device).json()
-        self.assertTrue(current["changed"])
-        self.assertTrue(current["display_changed"])
-        self.assertEqual(current["display_revision"], first_revision)
-        self.assertEqual(current["partial"]["text"], "现在我们讨论一下上传速度")
-        self.assertEqual(current["captions"], [])
-        self.assertEqual(self.storage.load_segments(first), [])
-
-        same_revision = service._store_live_partial(
-            first, text="现在我们讨论一下上传速度", start_sample=1600, end_sample=3600)
-        self.assertEqual(same_revision, first_revision)
-        unchanged_display = self.client.get(
-            f"/api/v2/device/sessions/{first}/state?after_revision=0&include_partial=1"
-            f"&after_display_revision={same_revision}", headers=device).json()
-        self.assertFalse(unchanged_display["changed"])
-        self.assertFalse(unchanged_display["display_changed"])
-        corrected_revision = service._store_live_partial(
-            first, text="现在讨论上传速度", start_sample=1600, end_sample=4000)
-        self.assertGreater(corrected_revision, first_revision)
-
-        other_revision = service._store_live_partial(
-            second, text="第二台设备自己的临时字幕", start_sample=0, end_sample=1600)
-        other = self.client.get(
-            f"/api/v2/device/sessions/{second}/state?after_revision=0&include_partial=1"
-            "&after_display_revision=0", headers=device).json()
-        self.assertEqual(other["display_revision"], other_revision)
-        self.assertEqual(other["partial"]["text"], "第二台设备自己的临时字幕")
-        self.assertEqual(self.client.get(
-            f"/api/v2/device/sessions/{first}/state?after_revision=0&include_partial=1",
-            headers=device).json()["partial"]["text"], "现在讨论上传速度")
-        bounded_revision = service._store_live_partial(
-            second, text="汉" * 300, start_sample=0, end_sample=3200)
-        bounded_partial = self.client.get(
-            f"/api/v2/device/sessions/{second}/state?after_revision=0&include_partial=1"
-            f"&after_display_revision={other_revision}", headers=device).json()
-        self.assertEqual(bounded_partial["display_revision"], bounded_revision)
-        self.assertLessEqual(len(bounded_partial["partial"]["text"].encode("utf-8")), 512)
-
-        before_abort = bounded_partial["display_revision"]
-        self.client.portal.call(service._abort_live, second)
-        aborted = self.client.get(
-            f"/api/v2/device/sessions/{second}/state?after_revision=0&include_partial=1"
-            f"&after_display_revision={before_abort}", headers=device).json()
-        self.assertTrue(aborted["display_changed"])
-        self.assertFalse(aborted["partial"]["active"])
-
-        _seg_id, formal_revision = service._store_live_caption(
-            first, text="现在讨论上传速度。", start_sample=1600, end_sample=4200)
-        confirmed = self.client.get(
-            f"/api/v2/device/sessions/{first}/state?after_revision=0&include_partial=1"
-            f"&after_display_revision={corrected_revision}", headers=device).json()
-        self.assertEqual(confirmed["revision"], formal_revision)
-        self.assertTrue(confirmed["display_changed"])
-        self.assertFalse(confirmed["partial"]["active"])
-        self.assertEqual(confirmed["partial"]["text"], "")
-        self.assertEqual(confirmed["captions"][-1]["text"], "现在讨论上传速度。")
-
-        before_restart = service._store_live_partial(
-            first, text="不会跨重启残留的半句话", start_sample=4200, end_sample=5000)
-        create_device_v2_router(self.storage)
-        recovered = self.storage.db.query_one(
-            "SELECT display_revision,partial_caption FROM device_sessions"
-            " WHERE server_session_id=?", (first,))
-        self.assertGreater(int(recovered["display_revision"]), before_restart)
-        self.assertEqual(recovered["partial_caption"], "")
-
-    def test_upload_ack_is_asr_independent_and_background_queue_is_ordered(self):
-        bound = self._bind()
-        device = {"Authorization": f"Bearer {bound['device_token']}"}
-        created = self.client.post("/api/v2/device/sessions", headers=device | {
-            "Idempotency-Key": "session:async-ack:create"}, json={
-                "client_session_id": "async-ack", "binding_generation": 1,
-                "audio": {"codec": "pcm_s16le", "sample_rate": 16000,
-                          "channels": 1, "bits_per_sample": 16}}).json()
-        sid = created["server_session_id"]
-
-        class SlowASR:
-            instances = []
-
-            def __init__(self):
-                self.sent = []
-                self.instances.append(self)
-
-            async def start(self, _session_id, _language="auto"):
-                await asyncio.sleep(1.0)
-
-            async def send_audio(self, data):
-                self.sent.append(data)
-                await asyncio.sleep(0.15)
-                return []
-
-            async def collect_results(self, _timeout=0.0):
-                return []
-
-            async def finish(self):
-                return []
-
-            async def close(self):
-                return None
-
-        chunk_32k = b"\x01\x00" * (32 * 1024 // 2)
-        chunk_160k = b"\x02\x00" * (160 * 1024 // 2)
-
-        def put(seq, offset, data):
-            return self.client.put(
-                f"/api/v2/device/sessions/{sid}/audio/{seq}", headers=device | {
-                    "Content-Type": "audio/L16;rate=16000;channels=1",
-                    "X-Content-SHA256": hashlib.sha256(data).hexdigest(),
-                    "X-Byte-Offset": str(offset), "X-Byte-Count": str(len(data))},
-                content=data)
-
-        with patch("app.device_api_v1.FunASRClient", SlowASR):
-            started = time.monotonic()
-            future = put(1, len(chunk_32k), chunk_160k)
-            ack_seconds = time.monotonic() - started
-            self.assertEqual(future.status_code, 200, future.text)
-            self.assertLess(ack_seconds, 0.7)
-            self.assertEqual(future.json()["received_chunks"], 0)
-
-            first = put(0, 0, chunk_32k)
-            self.assertEqual(first.status_code, 200, first.text)
-            self.assertEqual(first.json()["received_chunks"], 2)
-            self.assertEqual(first.json()["acknowledged_bytes"],
-                             len(chunk_32k) + len(chunk_160k))
-            self.client.portal.call(self.router.device_service._wait_live_feed, sid)
-
-            self.assertEqual(len(SlowASR.instances), 1)
-            self.assertEqual(SlowASR.instances[0].sent, [chunk_32k, chunk_160k])
-            duplicate = put(0, 0, chunk_32k)
-            self.assertTrue(duplicate.json()["duplicate"])
-            self.assertEqual(SlowASR.instances[0].sent, [chunk_32k, chunk_160k])
-
-    def test_v101_ordered_partial_events_and_revision_channels(self):
-        bound = self._bind()
-        device = {"Authorization": f"Bearer {bound['device_token']}"}
-        created = self.client.post("/api/v2/device/sessions", headers=device | {
-            "Idempotency-Key": "session:v101-display:create"}, json={
-                "client_session_id": "v101-display", "binding_generation": 1,
-                "audio": {"codec": "pcm_s16le", "sample_rate": 16000,
-                          "channels": 1, "bits_per_sample": 16}}).json()
-        sid = created["server_session_id"]
-        service = self.router.device_service
-        runtime = DeviceLiveRuntime(
-            asr=None, next_seq=0, next_sample=0, segment_start_sample=0,
-            source_language="auto", target_language=None, speaker_enabled=False)
-
-        # Real FunASR can drain the prior final followed by fragments of the
-        # next utterance.  The next partial must survive instead of being
-        # cleared by a collect-all-finals pass.
-        self.client.portal.call(
-            service._persist_live_results, sid, runtime, [
-                {"text": "上一句正式。", "is_final": True},
-                {"text": "下一", "partial_text": "下一", "is_final": False},
-                {"text": "句话", "partial_text": "下一句话", "is_final": False},
-            ], 16000)
-        first = self.client.get(
-            f"/api/v2/device/sessions/{sid}/state?after_revision=0&include_partial=1"
-            "&after_display_revision=0&include_display_events=1"
-            "&after_caption_revision=0&after_speaker_revision=0"
-            "&after_translation_revision=0&after_summary_revision=0",
-            headers=device).json()
-        self.assertEqual(first["partial"]["text"], "下一句话")
-        self.assertEqual([item["kind"] for item in first["display_events"]],
-                         ["final", "partial"])
-        self.assertEqual(first["display_events_through_revision"], 2)
-        self.assertFalse(first["display_events_pending"])
-        self.assertTrue(first["caption_changed"])
-        self.assertEqual(first["caption_updates"][0]["operation"], "upsert")
-        caption_revision = first["caption_revision"]
-        seg_id = first["caption_updates"][0]["seg_id"]
-
-        service._store_live_speaker(sid, seg_id, "spk_01", "说话人 1")
-        # V2.0.0 compatibility: a speaker-only revision must not resend the
-        # same formal text in legacy `captions`.
-        legacy = self.client.get(
-            f"/api/v2/device/sessions/{sid}/state?after_revision={caption_revision}",
-            headers=device).json()
-        self.assertTrue(legacy["changed"])
-        self.assertEqual(legacy["captions"], [])
-
-        channels = self.client.get(
-            f"/api/v2/device/sessions/{sid}/state?after_revision={caption_revision}"
-            f"&after_caption_revision={caption_revision}&after_speaker_revision=0"
-            "&after_translation_revision=0&after_summary_revision=0",
-            headers=device).json()
-        self.assertFalse(channels["caption_changed"])
-        self.assertTrue(channels["speaker_changed"])
-        self.assertEqual(channels["caption_updates"], [])
-        self.assertEqual(channels["speaker_updates"][0]["seg_id"], seg_id)
-
-        # A final in the same batch remains recoverable after the prior event
-        # cursor; firmware advances only through the last returned event.
-        self.client.portal.call(
-            service._persist_live_results, sid, runtime, [
-                {"text": "结束", "partial_text": "下一句话结束", "is_final": False},
-                {"text": "下一句话结束。", "is_final": True},
-            ], 32000)
-        second = self.client.get(
-            f"/api/v2/device/sessions/{sid}/state?after_revision={channels['revision']}"
-            "&include_partial=1&include_display_events=1&after_display_revision=2"
-            f"&after_caption_revision={caption_revision}"
-            f"&after_speaker_revision={channels['speaker_revision']}"
-            f"&after_translation_revision={channels['translation_revision']}"
-            f"&after_summary_revision={channels['summary_revision']}",
-            headers=device).json()
-        self.assertEqual([item["kind"] for item in second["display_events"]],
-                         ["partial", "final"])
-        self.assertFalse(second["partial"]["active"])
-        self.assertTrue(second["caption_changed"])
-
-        before_summary = second["summary_revision"]
-        self.storage.db.execute(
-            "UPDATE device_sessions SET revision=revision+1,summary_revision=revision+1"
-            " WHERE server_session_id=?", (sid,))
-        summary_only = self.client.get(
-            f"/api/v2/device/sessions/{sid}/state?after_revision={second['revision']}"
-            f"&after_caption_revision={second['caption_revision']}"
-            f"&after_speaker_revision={second['speaker_revision']}"
-            f"&after_translation_revision={second['translation_revision']}"
-            f"&after_summary_revision={before_summary}", headers=device).json()
-        self.assertTrue(summary_only["summary_changed"])
-        self.assertFalse(summary_only["caption_changed"])
-        self.assertEqual(summary_only["caption_updates"], [])
 
     def test_ack_requires_offset_continuity_and_missing_list_is_bounded(self):
         bound = self._bind()

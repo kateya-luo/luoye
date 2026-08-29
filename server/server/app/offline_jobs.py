@@ -21,7 +21,7 @@ from .segments import Patch, Timeline
 
 logger = logging.getLogger("ai_recorder.offline_jobs")
 
-JobReason = Literal["gap", "bulk", "finalize", "summarize"]  # summarize=哨兵：FIFO 保证在同会话补洞任务之后执行
+JobReason = Literal["gap", "bulk", "finalize", "canonical", "publish", "summarize"]
 BYTES_PER_MS = 16000 * 2 / 1000
 
 
@@ -43,6 +43,7 @@ class OfflineJobQueue:
         on_applied: Callable[[str, Timeline, Patch, str], Awaitable[None]],
         offline: FunASROfflineClient | None = None,
         on_summarize: Callable[[str], Awaitable[None]] | None = None,
+        on_canonical: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         on_gap_done: Callable[[str, int, int], None] | None = None,
         on_give_up: Callable[[OfflineJob, Exception], Awaitable[None]] | None = None,
         db: Any | None = None,
@@ -52,6 +53,7 @@ class OfflineJobQueue:
         self.get_timeline = get_timeline            # session_id -> Timeline | None
         self.on_applied = on_applied                # (session_id, timeline, patch, reason) -> 持久化+广播+重算
         self.on_summarize = on_summarize            # (session_id) -> 会议最终纪要（哨兵任务，在补洞之后执行一次）
+        self.on_canonical = on_canonical            # 整场权威ASR+声纹结果原子提交
         self.on_gap_done = on_gap_done              # (session_id, start_ms, end_ms) -> 洞处理完成（删持久化记录）
         self.on_give_up = on_give_up                # retries exhausted -> durable terminal state
         self.offline = offline or FunASROfflineClient()
@@ -91,7 +93,7 @@ class OfflineJobQueue:
         finalization = "open"
         for row in rows:
             state, reason, count = str(row["state"]), str(row["reason"]), int(row["n"])
-            if reason == "summarize":
+            if reason in {"summarize", "publish"}:
                 sealed = True
                 finalization = state
                 continue
@@ -218,7 +220,7 @@ class OfflineJobQueue:
                 now = self._now()
                 self.db.execute(
                     "UPDATE offline_asr_jobs SET state='done',lease_owner=NULL,lease_until=NULL,"
-                    "last_error=NULL,updated_at=? WHERE id=?", (now, job.job_id))
+                    "last_error=NULL,updated_at=? WHERE id=? AND state='running'", (now, job.job_id))
                 self._wake.set()
 
     async def _claim(self, owner: str) -> OfflineJob | None:
@@ -230,10 +232,18 @@ class OfflineJobQueue:
                 (now, now, now))
             row = self.db.query_one(
                 "SELECT j.* FROM offline_asr_jobs j WHERE j.state='queued' AND j.available_at<=?"
-                " AND (j.reason!='summarize' OR NOT EXISTS ("
-                "   SELECT 1 FROM offline_asr_jobs p WHERE p.session_id=j.session_id"
-                "   AND p.reason!='summarize' AND p.state IN ('queued','running')"
-                " ))"
+                " AND ("
+                "   j.reason NOT IN ('canonical','summarize','publish')"
+                "   OR (j.reason='canonical' AND NOT EXISTS ("
+                "     SELECT 1 FROM offline_asr_jobs p WHERE p.session_id=j.session_id"
+                "     AND p.reason NOT IN ('canonical','summarize','publish')"
+                "     AND p.state IN ('queued','running')"
+                "   ))"
+                "   OR (j.reason IN ('summarize','publish') AND NOT EXISTS ("
+                "     SELECT 1 FROM offline_asr_jobs p WHERE p.session_id=j.session_id"
+                "     AND p.reason NOT IN ('summarize','publish') AND p.state IN ('queued','running')"
+                "   ))"
+                " )"
                 " ORDER BY j.order_key,j.session_id,j.chunk_index,j.id LIMIT 1", (now,))
             if row is None:
                 return None
@@ -250,6 +260,11 @@ class OfflineJobQueue:
             return job
 
     async def _persistent_failure(self, job: OfflineJob, exc: Exception) -> None:
+        current = self.db.query_one("SELECT state FROM offline_asr_jobs WHERE id=?", (job.job_id,))
+        if current is None or current["state"] == "cancelled":
+            logger.info("offline_job_cancelled session_id=%s reason=%s",
+                        job.session_id, job.reason)
+            return
         attempts = int(job.attempts) + 1
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
@@ -261,7 +276,7 @@ class OfflineJobQueue:
             # 失败会话不得越过完成屏障生成一个看似成功但不完整的纪要。
             self.db.execute(
                 "UPDATE offline_asr_jobs SET state='cancelled',updated_at=? WHERE session_id=?"
-                " AND reason='summarize' AND state='queued'", (now, job.session_id))
+                " AND reason IN ('summarize','publish') AND state='queued'", (now, job.session_id))
             job.attempts = attempts
             logger.exception("offline_job_gave_up session_id=%s reason=%s",
                              job.session_id, job.reason)
@@ -283,10 +298,27 @@ class OfflineJobQueue:
         self._wake.set()
 
     async def _process(self, job: OfflineJob) -> None:
-        if job.reason == "summarize":
-            # 哨兵：本会话的补洞任务（FIFO 在前）都已处理，出唯一一次最终纪要
+        if job.reason in {"summarize", "publish"}:
+            # 完成屏障：补洞和 canonical 都已处理，只发布完整转写；旧 summarize
+            # 任务升级后也走此路径，绝不自动调用模型。
             if self.on_summarize:
                 await self.on_summarize(job.session_id)
+            return
+        if job.reason == "canonical":
+            if self.on_canonical is None:
+                raise RuntimeError("canonical finalization callback is not configured")
+            expected_sha256 = None
+            if self.db is not None:
+                row = self.db.query_one(
+                    "SELECT canonical_sha256 FROM device_sessions WHERE server_session_id=?",
+                    (job.session_id,))
+                expected_sha256 = str(row["canonical_sha256"] or "") if row else None
+            payload = await self.offline.finalize(job.session_id, expected_sha256)
+            await self.on_canonical(job.session_id, payload)
+            logger.info(
+                "offline_canonical_job_done session_id=%s segments=%d speakers=%d",
+                job.session_id, len(payload.get("segments") or []),
+                int(payload.get("speaker_count") or 0))
             return
         tl = self.get_timeline(job.session_id)
         if tl is None:

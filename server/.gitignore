@@ -1,29 +1,21 @@
-# 依赖与构建产物
+# Dependencies and build output
 node_modules/
 dist/
 __pycache__/
 *.py[cod]
 .venv/
-apps/desktop-client/native/publish/
-apps/desktop-client/native/**/bin/
-apps/desktop-client/native/**/obj/
-apps/desktop-client/app/client/
-apps/android-client/.gradle/
-apps/android-client/build/
-apps/android-client/app/build/
-apps/android-client/local.properties
-firmware/recorder-card/build/
-firmware/recorder-card/sdkconfig
-firmware/recorder-card/tools/*.exe
-firmware/recorder-card/tools/*.obj
 
-# 运行时数据与密钥（绝不入库）
+# Runtime data and secrets
 deploy/.env
+server/.env
 server/data/
 *.db
+*.db-*
+*.sqlite*
 *.pcm
+*.wav
 
-# 编辑器
+# Local test and editor state
+.pytest_cache/
 .vscode/
 .idea/
-.pytest_cache/

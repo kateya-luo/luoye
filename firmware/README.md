@@ -4,7 +4,12 @@ ESP32-S3 + 1.54" 方形墨水屏(GDEY0154D67/SSD1681, 200×200)+ 双 PDM 麦 + m
 
 当前方屏版本说明、按键表和烧录步骤见 [docs/UI154_FIRMWARE.md](docs/UI154_FIRMWARE.md)。
 内部产品名为 **落叶 / Luoye**，ESP-IDF 工程名保留为 `recorder_card`。
-当前固件版本：`2.3.2`，设备协议：`luoye-device-api/2`，配套服务器：ClearMeeting `1.0.1`。
+当前固件版本：`1.7.0`，设备协议：`luoye-device-api/2`，配套服务器：ClearMeeting `0.21.0`。
+V1.5.0 的电量百分比改为 3.180–4.100V 被动电压映射；它只负责显示，不参与充电终止或录音权限判断。详见 [docs/V1_5_0_PASSIVE_BATTERY_DISPLAY.md](docs/V1_5_0_PASSIVE_BATTERY_DISPLAY.md)。
+V1.5.1 调整墨水屏维护节奏：每分钟时间局刷、每10分钟 FAST、每逢整点 FULL，充电页每跨5%执行一次 FAST。详见 [docs/V1_5_1_REFRESH_CADENCE.md](docs/V1_5_1_REFRESH_CADENCE.md)。
+V1.5.2 删除所有人为电量涨跌速度和99%封顶，滤波电压直接映射百分比。详见 [docs/V1_5_2_DIRECT_VOLTAGE_SOC.md](docs/V1_5_2_DIRECT_VOLTAGE_SOC.md)。
+V1.6.0 R2 只修复手动补传再次进入时未立即继续的问题：重新确认同步会解除旧重试等待，并再次依据服务器 `upload-plan` 续传；不增加NVS状态，也不改变10 MiB和底层上传参数。详见 [docs/V1_6_0_MINIMAL_MANUAL_RESUME.md](docs/V1_6_0_MINIMAL_MANUAL_RESUME.md)。
+V1.7.0 R2 以 V1.5.2 的存储协议行为为基线，只保留 V1.6.0 R2 的纯 RAM 手动续传重启。SDSPI 使用516字节永久内部DMA容量，但线上仍严格发送原始的精确字节数（最终块514字节），并回移 ESP-IDF 5.5 分支的内部DMA判断；运行期真实I/O故障会锁存并停止后续SD访问。16 KiB应用层缓冲、10 MiB分段和上传网络参数保持不变。详见 [docs/V1_7_0_SDSPI_DMA_FAULT_GUARD.md](docs/V1_7_0_SDSPI_DMA_FAULT_GUARD.md)。
 交互行为以 **250×122 交互模拟器** 为规格书(`ai-recorder-card-sim-index-250x122.html`),
 `main/app_state.c` 是其中状态机的 1:1 C 移植 —— **改交互先改模拟器,确认后两边同步**。
 
@@ -59,7 +64,7 @@ HTTP 由单一网络业务调度器仲裁，SD 录音写入不依赖网络。
 在 ESP-IDF PowerShell 中执行：
 
 ```powershell
-cd D:\OPENOP\recorder-card-hw-test\firmware\recorder-card-v070-100ma
+cd firmware
 .\tools\run_engineering_checks.ps1 -Profile dev -FullClean
 ```
 
@@ -85,7 +90,7 @@ cd D:\OPENOP\recorder-card-hw-test\firmware\recorder-card-v070-100ma
 
 ```powershell
 .\tools\run_engineering_checks.ps1 -Profile engineering -FullClean -Package `
-  -ReleaseId luoye-fw-v2.3.2-engineering-live-io-r1 `
+  -ReleaseId luoye-fw-v1.7.0-engineering-sdspi-exact-dma-r2 `
   -ServerBaseUrl http://clearmeeting.chat:34567 -AllowInsecureHttp
 ```
 
@@ -131,7 +136,7 @@ cd D:\OPENOP\recorder-card-hw-test\firmware\recorder-card-v070-100ma
 | 录音长按 BACK 3s 锁键;待机长按 BACK 配网 | `long_press` |
 | 录音开始立即显示；章节纪要按自然分钟边界刷新；待机分钟刷新 | 所有产品页面统一使用 SSD1681 差分快刷 |
 | RTC 到点提醒(REC 开录 / BACK 关闭 / 长按 BACK +10min) | `rtc_alarm` + PCF8563 闹钟 |
-| 电量 <5% 拒绝开录;SD 将满 FULL 黄灯 | `start_rec` / `space_task` |
+| 电量只负责显示，不限制录音；SD 将满显示 FULL 黄灯 | `power_soc` / `space_task` |
 
 ## 已知限制（工程版，量产前必修）
 

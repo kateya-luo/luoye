@@ -14,6 +14,10 @@ foreach ($required in @(
     'net_idle_agenda_maintenance_stop',
     'net_request_agenda_sync',
     'IDLE_AGENDA_MAINTENANCE_MS',
+    'idle_half_hour',
+    'idle_top_of_hour',
+    'idle_ten_minute',
+    'ui_request_render(APP_RENDER_FAST)',
     'APP_RENDER_FULL',
     'return false;')) {
     if ($main -notmatch [regex]::Escape($required)) {

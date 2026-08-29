@@ -1,5 +1,5 @@
 // Derive display metadata for archived meetings from real backend data.
-import {formatClock} from './summaryDerive';
+import {formatClock} from './summaryDerive.js';
 
 const EXPORTED_KEY = 'clear-meeting-exported';
 const encoder = new TextEncoder();
@@ -60,6 +60,7 @@ export function meetingTitle(meeting) {
   const summary = meeting?.summary;
   // 详情对象：summary 是 object，有 mindmap / decisions 等字段
   if (summary && typeof summary === 'object') {
+    if (typeof summary.title === 'string' && summary.title.trim()) return summary.title.trim();
     if (summary.mindmap?.branches?.length && summary.mindmap.title) return summary.mindmap.title;
     if (typeof summary.summary === 'string' && summary.summary.length) return summary.summary.slice(0, 28);
   }
@@ -67,6 +68,18 @@ export function meetingTitle(meeting) {
   if (typeof summary === 'string' && summary.length && summary !== '暂无摘要') return summary.slice(0, 28);
   return (meeting?.transcript_preview || '').replace(/\[说话人\s*\d+\]\s*/g, '').trim().slice(0, 28) || '未命名会议';
 }
+
+export function safeFileBaseName(value, fallback = '未命名会议') {
+  let name = String(value || '').normalize('NFKC')
+    .replace(/[\u0000-\u001f<>:"/\\|?*]/g, '-')
+    .replace(/\s+/g, ' ').trim()
+    .replace(/[. ]+$/g, '');
+  if (!name) name = fallback;
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(name)) name = `${name}-会议`;
+  return Array.from(name).slice(0, 80).join('');
+}
+
+export const meetingExportBaseName = (meeting) => safeFileBaseName(meetingTitle(meeting));
 
 // "已导出" tracking (client-side, since backend doesn't record it).
 export function isExported(sessionId) {

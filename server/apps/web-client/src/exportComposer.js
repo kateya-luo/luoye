@@ -1,8 +1,8 @@
 // Client-side meeting exporter. Honors section checkboxes + info page + watermark,
 // so partial exports work without backend changes. TXT / Markdown / Word(.doc HTML) / JSON.
-import {durationLabel, durationSeconds, participantCount, shortId, meetingTitle, markExported} from './meetingMeta';
-import {buildChapters} from './summaryDerive';
-import {roleLabel} from './speakers';
+import {durationLabel, durationSeconds, participantCount, shortId, meetingTitle, meetingExportBaseName, markExported} from './meetingMeta.js';
+import {buildChapters} from './summaryDerive.js';
+import {roleLabel} from './speakers.js';
 
 function lines(meeting) {
   if (meeting.segments?.length) return meeting.segments.map((s) =>
@@ -75,11 +75,11 @@ function clockOf(ms) {
 }
 
 // Word(.doc) 导出：MSO 兼容 HTML，设计感排版——彩色封面 / 信息表 / 摘要 / 结论 / 待办表 /
-// 滚动纪要时间线(取代思维导图) / 双语字幕表。用背景色带 + 细横线做层次，避开"表格网格"的廉价感。
-function toWordHtml(meeting, opts) {
+// 模板会议纪要 / 双语字幕表。用背景色带 + 细横线做层次。
+export function toWordHtml(meeting, opts) {
   const esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   // 克制的双色：靛蓝主色 + 深墨字 + 淡背景带，只有强调处见色
-  const AC = '#4338ca', AC2 = '#eef1fb', INK = '#111827', SUB = '#6b7280', HAIR = '#e6e8ef', BAND = '#f7f8fb';
+  const AC = '#4338ca', INK = '#111827', SUB = '#6b7280', HAIR = '#e6e8ef', BAND = '#f7f8fb';
   const s = meeting.summary || {};
   const body = [];
   // 章节标题：小号靛蓝眉标 + 大标题 + 一条细底线（不用重边框，留白见档次）
@@ -137,15 +137,13 @@ function toWordHtml(meeting, opts) {
       : `<p style="font-size:10pt;color:${SUB};margin:0">（本场会议未识别到待办事项）</p>`);
   }
 
-  // —— 滚动纪要时间线（取代思维导图；由 buildChapters 从纪要要点分段生成，便于快速检索）——
+  // —— 按所选模板生成的会议纪要——
   const chapters = buildChapters(s, meeting.created_at ? new Date(meeting.created_at) : null, durationSeconds(meeting) || 0);
   if (opts.sections.minutes && chapters.length) {
-    body.push(H('ROLLING MINUTES', `滚动纪要 · ${chapters.length} 个要点`));
+    body.push(H('MEETING MINUTES', `会议纪要 · ${chapters.length} 个要点`));
     body.push(`<table cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse">${
-      chapters.map((c) => `<tr>
-        <td style="width:52pt;padding:8pt 8pt 8pt 0;vertical-align:top">
-          <table cellspacing="0" cellpadding="0"><tr><td style="background:${AC2};color:${AC};font-size:9pt;font-weight:bold;padding:2pt 6pt;text-align:center">${esc(c.time)}</td></tr></table>
-        </td>
+      chapters.map((c, i) => `<tr>
+        <td style="width:22pt;padding:8pt 8pt 8pt 0;color:${AC};font-size:10pt;font-weight:bold;vertical-align:top">${String(i + 1).padStart(2, '0')}</td>
         <td style="padding:8pt 0 8pt 12pt;border-left:1.5pt solid ${HAIR};vertical-align:top">
           <p style="margin:0 0 4pt;font-size:11.5pt;font-weight:bold;color:${INK}">${esc(c.title)}</p>
           ${(c.items || []).map((it) => `<p style="margin:0 0 3pt;font-size:10.5pt;color:${INK};line-height:1.7">· ${esc(it)}</p>`).join('')}
@@ -218,7 +216,7 @@ export function composeExport(meeting, format, options) {
   const spec = FORMATS[format];
   if (!spec) throw new Error(`暂不支持的格式：${format}`);
   const content = spec.build(meeting, options);
-  download(`${shortId(meeting.session_id) || 'meeting'}.${spec.ext}`, spec.mime, content);
+  download(`${meetingExportBaseName(meeting)}.${spec.ext}`, spec.mime, content);
   markExported(meeting.session_id);
   return {bytes: new TextEncoder().encode(content).length};
 }

@@ -28,7 +28,8 @@ class StorageSqliteTest(unittest.TestCase):
         m = self.storage.get_meeting("m1")
         self.assertEqual(m["transcript"], ["[说话人 1] 第一句", "第二句"])
         self.assertEqual([s["seg_id"] for s in m["segments"]], ["a", "b"])
-        self.assertTrue(m["summary_pending"])          # 纪要未生成
+        self.assertFalse(m["summary_pending"])         # 未点击生成，不是后台生成中
+        self.assertEqual(m["minutes_status"], "not_created")
         self.storage.save_summary("m1", {"summary": "总结", "decisions": [], "action_items": [],
                                          "mindmap": {"title": "主题X", "branches": [{"title": "t", "items": ["i"]}]}})
         m = self.storage.get_meeting("m1")
@@ -71,6 +72,168 @@ class StorageSqliteTest(unittest.TestCase):
         m = self.storage.get_meeting("m1")
         self.assertEqual({s["seg_id"]: s.get("translation") for s in m["segments"]}["a"], "大家好。")
 
+    def test_canonical_publish_is_atomic_and_records_pipeline_run(self):
+        self.storage.create_meeting("canonical-meeting")
+        self.storage.upsert_segment(
+            "canonical-meeting", seg("old-live", 0, 500, "旧的实时字幕"))
+        # This storage-level test does not need the pairing/device fixtures.
+        self.storage.db.execute("PRAGMA foreign_keys=OFF")
+        self.storage.db.execute(
+            "INSERT INTO device_sessions(server_session_id,client_session_id,device_id,"
+            "owner_user_id,binding_generation,started_at_utc,codec,sample_rate,channels,"
+            "bits_per_sample,status,revision,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("canonical-meeting", "client-1", "device-1", "TEST1", 1,
+             "2026-08-27T00:00:00+00:00", "pcm_s16le", 16000, 1, 16,
+             "processing", 4, "2026-08-27T00:00:00+00:00",
+             "2026-08-27T00:00:00+00:00"))
+        self.storage.db.execute("PRAGMA foreign_keys=ON")
+        one = seg("canon-1", 0, 900, "第一句", "说话人 1", "offline_canonical")
+        one["speaker_id"] = "spk_01"
+        two = seg("canon-2", 900, 1800, "第二句", "说话人 2", "offline_canonical")
+        two["speaker_id"] = "spk_02"
+        run = {
+            "canonical_sha256": "a" * 64,
+            "pipeline_version": "offline-canonical-diarization-v2.0.0",
+            "speaker_count": 2,
+            "processing_ms": 1234,
+            "realtime_factor": 0.12,
+            "speakers": [
+                {"speaker_id": "spk_01", "label": "说话人 1", "segment_count": 1},
+                {"speaker_id": "spk_02", "label": "说话人 2", "segment_count": 1},
+            ],
+        }
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.storage.replace_canonical_segments(
+                "canonical-meeting", [one, dict(one)], run)
+        self.assertEqual(
+            [item["seg_id"] for item in self.storage.load_segments("canonical-meeting")],
+            ["old-live"],
+        )
+
+        revision = self.storage.replace_canonical_segments(
+            "canonical-meeting", [one, two], run)
+        self.assertEqual(revision, 5)
+        self.assertEqual(
+            [item["seg_id"] for item in self.storage.load_segments("canonical-meeting")],
+            ["canon-1", "canon-2"],
+        )
+        saved_run = self.storage.db.query_one(
+            "SELECT * FROM canonical_diarization_runs WHERE session_id=?",
+            ("canonical-meeting",),
+        )
+        self.assertEqual(saved_run["state"], "done")
+        self.assertEqual(saved_run["speaker_count"], 2)
+        self.assertEqual(
+            len(self.storage.get_meta_info("canonical-meeting")["speakers"]), 2)
+
+    def test_background_processing_status_tracks_upload_queue_diarization_and_publish(self):
+        sid = "processing-meeting"
+        now = "2026-08-28T01:00:00+00:00"
+        self.storage.create_meeting(sid)
+        self.storage.db.execute("PRAGMA foreign_keys=OFF")
+        self.storage.db.execute(
+            "INSERT INTO device_sessions(server_session_id,client_session_id,device_id,"
+            "owner_user_id,binding_generation,started_at_utc,codec,sample_rate,channels,"
+            "bits_per_sample,status,canonical_total_bytes,expected_samples,revision,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, "client-progress", "device-progress", "TEST1", 1, now,
+             "pcm_s16le", 16000, 1, 16, "uploading", 320000, 160000, 0, now, now))
+        self.storage.db.execute(
+            "INSERT INTO device_audio_ranges(server_session_id,start_byte,end_byte,sha256,byte_count,created_at)"
+            " VALUES(?,?,?,?,?,?)", (sid, 0, 160000, "a" * 64, 160000, now))
+        self.storage.db.execute("PRAGMA foreign_keys=ON")
+
+        uploading = self.storage.get_processing_status(sid)
+        self.assertTrue(uploading["active"])
+        self.assertEqual(uploading["stage"], "uploading")
+        self.assertEqual(uploading["upload"]["percent"], 50)
+        self.assertEqual(uploading["progress_percent"], 50)
+        self.assertEqual(uploading["upload"]["missing_bytes"], 160000)
+        self.assertEqual(uploading["upload"]["missing_duration_ms"], 5000)
+        self.assertIn("仍缺约 5 秒", uploading["detail"])
+
+        # Overlapping retry records are counted as union coverage, never twice.
+        self.storage.db.execute(
+            "INSERT INTO device_audio_ranges(server_session_id,start_byte,end_byte,sha256,byte_count,created_at)"
+            " VALUES(?,?,?,?,?,?)", (sid, 80000, 160000, "b" * 64, 80000, now))
+        retried = self.storage.get_processing_status(sid)
+        self.assertEqual(retried["upload"]["received_bytes"], 160000)
+        self.assertEqual(retried["progress_percent"], 50)
+
+        self.storage.db.execute(
+            "UPDATE device_sessions SET status='processing' WHERE server_session_id=?", (sid,))
+        self.storage.set_state(sid, "finalizing")
+        jobs = [
+            (sid, 0, 5000, "bulk", 0, "done"),
+            (sid, 5000, 10000, "bulk", 1, "running"),
+            (sid, 0, 0, "canonical", 2147483646, "queued"),
+            (sid, 0, 0, "publish", 2147483647, "queued"),
+        ]
+        for index, (session_id, start_ms, end_ms, reason, chunk_index, state) in enumerate(jobs):
+            self.storage.db.execute(
+                "INSERT INTO offline_asr_jobs(session_id,start_ms,end_ms,reason,chunk_index,"
+                "order_key,state,attempts,available_at,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,0,?,?,?)",
+                (session_id, start_ms, end_ms, reason, chunk_index, now, state,
+                 now, now, now))
+
+        transcribing = self.storage.get_processing_status(sid)
+        self.assertEqual(transcribing["stage"], "transcribing")
+        self.assertEqual(transcribing["jobs"]["done"], 1)
+        self.assertGreater(transcribing["eta_seconds"], 0)
+
+        self.storage.db.execute(
+            "UPDATE offline_asr_jobs SET state='done' WHERE session_id=? AND reason='bulk'", (sid,))
+        self.storage.db.execute(
+            "UPDATE offline_asr_jobs SET state='running' WHERE session_id=? AND reason='canonical'", (sid,))
+        diarizing = self.storage.get_processing_status(sid)
+        self.assertEqual(diarizing["stage"], "diarizing")
+        self.assertIn("多人识别", diarizing["title"])
+
+        self.storage.db.execute(
+            "UPDATE offline_asr_jobs SET state='done' WHERE session_id=? AND reason='canonical'", (sid,))
+        self.storage.db.execute(
+            "UPDATE offline_asr_jobs SET state='running' WHERE session_id=? AND reason='publish'", (sid,))
+        self.assertEqual(self.storage.get_processing_status(sid)["stage"], "publishing")
+
+        self.storage.db.execute(
+            "UPDATE offline_asr_jobs SET state='done' WHERE session_id=? AND reason='publish'", (sid,))
+        self.storage.db.execute(
+            "UPDATE device_sessions SET status='done' WHERE server_session_id=?", (sid,))
+        self.storage.set_state(sid, "transcript_ready")
+        complete = self.storage.get_processing_status(sid)
+        self.assertFalse(complete["active"])
+        self.assertEqual(complete["stage"], "completed")
+        self.assertEqual(complete["progress_percent"], 100)
+
+    def test_background_processing_failure_does_not_expose_internal_error(self):
+        sid = "failed-processing"
+        self.storage.create_meeting(sid)
+        self.storage.set_state(sid, "finalizing")
+        now = "2026-08-28T01:00:00+00:00"
+        self.storage.db.execute(
+            "INSERT INTO offline_asr_jobs(session_id,start_ms,end_ms,reason,chunk_index,"
+            "order_key,state,attempts,available_at,last_error,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,'failed',31,?,?,?,?)",
+            (sid, 0, 300000, "bulk", 0, now, now,
+             "ConnectionError: http://internal-service:10097/secret", now, now))
+        failed = self.storage.get_processing_status(sid)
+        self.assertEqual(failed["stage"], "failed")
+        self.assertNotIn("internal-service", failed["detail"])
+
+    def test_finalizing_without_queue_is_reported_as_stalled_not_processing_forever(self):
+        sid = "stalled-processing"
+        self.storage.create_meeting(sid)
+        self.storage.db.execute(
+            "UPDATE meetings SET state='finalizing',updated_at=? WHERE session_id=?",
+            ("2026-08-20T00:00:00+00:00", sid))
+        stalled = self.storage.get_processing_status(sid)
+        self.assertFalse(stalled["active"])
+        self.assertEqual(stalled["stage"], "stalled")
+        self.assertEqual(stalled["error_code"], "BACKGROUND_QUEUE_STALLED")
+
     def test_apply_patch_is_incremental(self):
         self.storage.create_meeting("m1")
         self.storage.upsert_segment("m1", seg("live1", 0, 10000, "断网前", "说话人 1"))
@@ -92,6 +255,34 @@ class StorageSqliteTest(unittest.TestCase):
             self.storage.set_title("nope", "x")
         self.assertTrue(self.storage.delete_meeting("m1"))
         self.assertIsNone(self.storage.get_meeting("m1"))
+
+    def test_delete_meeting_cancels_device_and_background_jobs(self):
+        sid = "delete-processing"
+        now = "2026-08-28T01:00:00+00:00"
+        self.storage.create_meeting(sid)
+        self.storage.db.execute("PRAGMA foreign_keys=OFF")
+        self.storage.db.execute(
+            "INSERT INTO device_sessions(server_session_id,client_session_id,device_id,"
+            "owner_user_id,binding_generation,started_at_utc,codec,sample_rate,channels,"
+            "bits_per_sample,status,revision,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, "client-delete", "device-delete", "TEST1", 1, now,
+             "pcm_s16le", 16000, 1, 16, "processing", 0, now, now))
+        self.storage.db.execute("PRAGMA foreign_keys=ON")
+        self.storage.db.execute(
+            "INSERT INTO offline_asr_jobs(session_id,start_ms,end_ms,reason,chunk_index,"
+            "order_key,state,attempts,available_at,lease_owner,lease_until,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,'running',0,?,'worker','2099-01-01T00:00:00+00:00',?,?)",
+            (sid, 0, 0, "canonical", 0, now, now, now, now))
+
+        self.assertTrue(self.storage.delete_meeting(sid))
+        job = self.storage.db.query_one(
+            "SELECT state,lease_owner FROM offline_asr_jobs WHERE session_id=?", (sid,))
+        device = self.storage.db.query_one(
+            "SELECT status FROM device_sessions WHERE server_session_id=?", (sid,))
+        self.assertEqual(job["state"], "cancelled")
+        self.assertIsNone(job["lease_owner"])
+        self.assertEqual(device["status"], "cancelled")
 
     def test_gaps_and_coverage_survive_reopen(self):
         self.storage.create_meeting("m1")

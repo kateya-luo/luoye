@@ -15,6 +15,8 @@
 #include "esp_log.h"
 
 static const char *TAG = "power";
+#define BATTERY_EMERGENCY_MV 3100
+#define BATTERY_EMERGENCY_SAMPLES 3
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_max17048, s_pcf8563, s_bq25186;
 static power_post_fn s_post;
@@ -183,20 +185,16 @@ typedef struct {
   const char *band;
 } bq_charge_target_t;
 
-static bq_charge_target_t bq_target_for_soc(int soc) {
+static bq_charge_target_t bq_charge_target(void) {
   /* MAX17048 is a reporting fuel gauge, not the charge terminator.  Keep the
      1A CC setpoint and let BQ25186's CV/ITERM state machine declare done. */
-  (void)soc;
   return (bq_charge_target_t){true, BQ25186_LOW_SOC_CHARGE_MA,
                              BQ25186_LOW_SOC_INPUT_MA, "1a_cc"};
 }
 
-static esp_err_t bq_apply_charge_policy(int soc,
-                                        const bq25186_status_t *current) {
-  if (!current || !current->valid || soc < 0 || soc > 100) {
-    return ESP_ERR_INVALID_ARG;
-  }
-  bq_charge_target_t target = bq_target_for_soc(soc);
+static esp_err_t bq_apply_charge_policy(const bq25186_status_t *current) {
+  if (!current || !current->valid) return ESP_ERR_INVALID_ARG;
+  bq_charge_target_t target = bq_charge_target();
   uint8_t desired_ichg = bq_ichg_ma_to_code(target.charge_ma) & 0x7FU;
   if (!target.enabled) desired_ichg |= 0x80U;
   uint8_t desired_ilim = (uint8_t)((current->tmr_ilim & ~0x07U) |
@@ -233,8 +231,8 @@ static esp_err_t bq_apply_charge_policy(int soc,
 
   if (ichg_changed || ilim_changed) {
     ESP_LOGI(TAG,
-             "LY|BQ_POLICY|event=apply soc=%d band=%s enabled=%d ichg=%dmA ilim=%dmA ce=%d",
-             soc, target.band, target.enabled,
+             "LY|BQ_POLICY|event=apply source=charger_only band=%s enabled=%d ichg=%dmA ilim=%dmA ce=%d",
+             target.band, target.enabled,
              bq_ichg_code_to_ma(verify_ichg),
              bq_ilim_code_to_ma(verify_ilim), gpio_get_level(PIN_BQ_CE_N));
   }
@@ -454,64 +452,34 @@ static void poll_task(void *arg) {
   app_charge_t candidate_chg = (app_charge_t)-1;
   unsigned candidate_count = 0;
   unsigned bq_log_divider = 0;
-  int history[3] = {-1, -1, -1};
-  unsigned history_count = 0, history_index = 0;
   bool used_voltage_last = false;
-  int reported_soc = -1;
-  TickType_t reported_step_tick = 0;
+  power_soc_display_t display_state;
+  power_soc_display_init(&display_state);
+  unsigned emergency_voltage_count = 0;
+  bool emergency_voltage_logged = false;
   for (;;) {
     int gauge_soc_x256 = power_battery_soc_x256();
     int gauge_soc = gauge_soc_x256 < 0 ? -1 : gauge_soc_x256 / 256;
-    int soc = gauge_soc;
-    int control_soc = gauge_soc;
     int mv = power_battery_mv();
-    bool used_voltage = soc < 0;
-    if (used_voltage && mv > 0) {
-      if (mv >= 4200) soc = 100;
-      else if (mv >= 4100) soc = 90;
-      else if (mv >= 4000) soc = 80;
-      else if (mv >= 3900) soc = 65;
-      else if (mv >= 3800) soc = 45;
-      else if (mv >= 3700) soc = 25;
-      else if (mv >= 3600) soc = 12;
-      else if (mv >= 3500) soc = 6;
-      else if (mv >= 3400) soc = 3;
-      else soc = 1;
+    bool used_voltage = gauge_soc_x256 < 0;
+    if (used_voltage != used_voltage_last) {
+      ESP_LOGW(TAG,
+               "LY|POWER|gauge=%s display_source=filtered_voltage raw_soc=%d mv=%d",
+               used_voltage ? "unavailable" : "available", gauge_soc, mv);
     }
-    int calibrated_soc = soc;
-    if (!used_voltage && gauge_soc_x256 >= 0) {
-      calibrated_soc = power_soc_calibrate_x256(gauge_soc_x256);
-    }
-    int filtered_soc = calibrated_soc;
-    if (calibrated_soc >= 0) {
-      history[history_index] = calibrated_soc;
-      history_index = (history_index + 1U) % 3U;
-      if (history_count < 3) history_count++;
-      if (history_count == 3 && calibrated_soc > 3 && mv > 3400) {
-        int a = history[0], b = history[1], c = history[2];
-        filtered_soc = a > b ? (b > c ? b : (a > c ? c : a))
-                             : (a > c ? a : (b > c ? c : b));
-      }
-      if (used_voltage != used_voltage_last) {
-        ESP_LOGW(TAG, "LY|POWER|battery_source=%s soc=%d mv=%d",
-                 used_voltage ? "voltage_fallback" : "max17048",
-                 filtered_soc, mv);
-      }
-      used_voltage_last = used_voltage;
-    } else {
-      ESP_LOGW(TAG, "LY|POWER|event=battery_read_failed soc=%d mv=%d", soc, mv);
-    }
+    used_voltage_last = used_voltage;
+    if (mv <= 0) ESP_LOGW(TAG, "LY|POWER|event=voltage_read_failed mv=%d", mv);
     bq25186_status_t bq = {0};
     bool bq_ok = bq_read_status(&bq);
     bool unplugged = gpio_get_level(PIN_BQ_PG_N) != 0;
-    if (!unplugged && bq_ok && control_soc >= 0) {
-      esp_err_t policy_error = bq_apply_charge_policy(control_soc, &bq);
+    if (!unplugged && bq_ok) {
+      esp_err_t policy_error = bq_apply_charge_policy(&bq);
       if (policy_error == ESP_OK) {
         /* Refresh the status used by the UI after a register change. */
         bq_ok = bq_read_status(&bq);
       } else {
-        ESP_LOGW(TAG, "LY|BQ_POLICY|event=apply_failed soc=%d esp=%s keep_previous=1",
-                 control_soc, esp_err_to_name(policy_error));
+        ESP_LOGW(TAG, "LY|BQ_POLICY|event=apply_failed esp=%s keep_previous=1",
+                 esp_err_to_name(policy_error));
       }
     }
     app_charge_t chg = unplugged ? APP_CHG_NONE :
@@ -535,41 +503,31 @@ static void poll_task(void *arg) {
       }
     }
     app_charge_t stable_chg = last_chg == (app_charge_t)-1 ? chg : last_chg;
-    int displayed_soc = calibrated_soc;
-    if (calibrated_soc >= 0) {
-      int target_soc = stable_chg == APP_CHG_FULL ? 100 : filtered_soc;
-      if (!unplugged && stable_chg != APP_CHG_FULL && target_soc >= 100) {
-        target_soc = 99;
-      }
-      TickType_t now_tick = xTaskGetTickCount();
-      if (reported_soc < 0) {
-        reported_soc = target_soc;
-        reported_step_tick = now_tick;
-      } else if (stable_chg == APP_CHG_FULL) {
-        reported_soc = 100;
-        reported_step_tick = now_tick;
-      } else if (!unplugged) {
-        if (target_soc > reported_soc &&
-            now_tick - reported_step_tick >= pdMS_TO_TICKS(30 * 1000)) {
-          reported_soc++;
-          reported_step_tick = now_tick;
+    int mapped_soc = mv > 0 ? power_soc_from_voltage(mv) : -1;
+    int displayed_soc = power_soc_display_update(&display_state, mv,
+                                                  unplugged);
+    int filtered_soc = displayed_soc;
+    if (displayed_soc >= 0) s_post(APP_EV_BATTERY, displayed_soc);
+
+    if (unplugged && mv > 0 && mv <= BATTERY_EMERGENCY_MV) {
+      if (++emergency_voltage_count >= BATTERY_EMERGENCY_SAMPLES) {
+        emergency_voltage_count = 0;
+        if (!emergency_voltage_logged) {
+          emergency_voltage_logged = true;
+          ESP_LOGW(TAG,
+                   "LY|POWER|event=emergency_voltage mv=%d samples=%u action=safe_close_if_recording",
+                   mv, (unsigned)BATTERY_EMERGENCY_SAMPLES);
         }
-      } else if (target_soc < reported_soc) {
-        if (target_soc <= 10 || mv <= 3550) {
-          reported_soc = target_soc;
-          reported_step_tick = now_tick;
-        } else if (now_tick - reported_step_tick >= pdMS_TO_TICKS(60 * 1000)) {
-          reported_soc--;
-          reported_step_tick = now_tick;
-        }
+        s_post(APP_EV_BATTERY_CRITICAL, mv);
       }
-      displayed_soc = reported_soc;
-      s_post(APP_EV_BATTERY, displayed_soc);
+    } else {
+      emergency_voltage_count = 0;
+      if (!unplugged || mv >= 3180) emergency_voltage_logged = false;
     }
 
     power_diag_sample_t diag = {
       .gauge_soc_x256 = gauge_soc_x256,
-      .calibrated_soc = calibrated_soc,
+      .mapped_soc = mapped_soc,
       .filtered_soc = filtered_soc,
       .displayed_soc = displayed_soc,
       .battery_mv = mv,
@@ -609,11 +567,12 @@ static void poll_task(void *arg) {
                bq_ok ? !!(bq.stat0 & 0x04U) : -1,
                bq_ok ? !!(bq.stat0 & 0x02U) : -1, displayed_soc, mv);
       ESP_LOGI(TAG,
-               "LY|POWER_DIAG|source=power seq=%lu raw=%d.%02d calibrated=%d filtered=%d shown=%d mv=%d usb=%d charge=%d phase=%u ichg=%d ilim=%d config=0x%02X%02X hibrt=0x%02X%02X status=0x%02X%02X version=0x%02X%02X fallback=%d",
+               "LY|POWER_DIAG|source=power seq=%lu raw=%d.%02d mapped=%d filtered_mv=%d target=%d shown=%d mv=%d usb=%d charge=%d phase=%u ichg=%d ilim=%d config=0x%02X%02X hibrt=0x%02X%02X status=0x%02X%02X version=0x%02X%02X gauge_unavailable=%d",
                (unsigned long)diag.sequence,
                gauge_soc_x256 < 0 ? -1 : gauge_soc_x256 / 256,
                gauge_soc_x256 < 0 ? 0 : (gauge_soc_x256 % 256) * 100 / 256,
-               calibrated_soc, filtered_soc, displayed_soc, mv, !unplugged,
+               mapped_soc, display_state.filtered_mv, filtered_soc,
+               displayed_soc, mv, !unplugged,
                (int)stable_chg,
                (unsigned)((bq.stat0 >> 5) & 0x03U), diag.charge_ma,
                diag.input_limit_ma, diag.max_config[0], diag.max_config[1],

@@ -106,96 +106,9 @@ bool luoye_live_append_text(char *destination, size_t destination_size,
   return true;
 }
 
-void luoye_live_caption_cache_init(luoye_live_caption_cache_t *cache) {
-  if (cache) memset(cache, 0, sizeof(*cache));
-}
-
-static int caption_current_index(const luoye_live_caption_cache_t *cache,
-                                 const char *seg_id) {
-  if (!cache || !seg_id) return -1;
-  for (uint8_t i = 0; i < cache->current_count; ++i) {
-    if (strcmp(cache->current[i].seg_id, seg_id) == 0) return (int)i;
-  }
-  return -1;
-}
-
-static bool caption_was_seen(const luoye_live_caption_cache_t *cache,
-                             const char *seg_id) {
-  if (!cache || !seg_id) return false;
-  for (uint8_t i = 0; i < cache->seen_count; ++i) {
-    if (strcmp(cache->seen[i], seg_id) == 0) return true;
-  }
-  return false;
-}
-
-static void caption_remember(luoye_live_caption_cache_t *cache,
-                             const char *seg_id) {
-  if (cache->seen_count < LUOYE_LIVE_CAPTION_SEEN_ITEMS) {
-    size_t length = strlen(seg_id);
-    memcpy(cache->seen[cache->seen_count++], seg_id, length + 1U);
-    return;
-  }
-  size_t length = strlen(seg_id);
-  memcpy(cache->seen[cache->seen_cursor], seg_id, length + 1U);
-  cache->seen_cursor = (uint8_t)((cache->seen_cursor + 1U) %
-                                 LUOYE_LIVE_CAPTION_SEEN_ITEMS);
-}
-
-bool luoye_live_caption_upsert(luoye_live_caption_cache_t *cache,
-                               const char *seg_id, const char *text) {
-  if (!cache || !seg_id || !seg_id[0] || !text || !text[0] ||
-      strlen(seg_id) >= LUOYE_LIVE_CAPTION_ID_BYTES ||
-      strlen(text) >= LUOYE_LIVE_CAPTION_TEXT_BYTES) return false;
-  int existing = caption_current_index(cache, seg_id);
-  if (existing >= 0) {
-    if (strcmp(cache->current[existing].text, text) == 0) return false;
-    size_t text_length = strlen(text);
-    memcpy(cache->current[existing].text, text, text_length + 1U);
-    return true;
-  }
-  /* An update for a segment older than the bounded display cache is still an
-     upsert, not a new sentence. It cannot affect the newest four lines. */
-  if (caption_was_seen(cache, seg_id)) return false;
-  caption_remember(cache, seg_id);
-  if (cache->current_count == LUOYE_LIVE_CAPTION_CACHE_ITEMS) {
-    memmove(&cache->current[0], &cache->current[1],
-            sizeof(cache->current[0]) *
-              (LUOYE_LIVE_CAPTION_CACHE_ITEMS - 1U));
-    cache->current_count--;
-  }
-  luoye_live_caption_t *entry = &cache->current[cache->current_count++];
-  memcpy(entry->seg_id, seg_id, strlen(seg_id) + 1U);
-  memcpy(entry->text, text, strlen(text) + 1U);
-  return true;
-}
-
-bool luoye_live_caption_build(const luoye_live_caption_cache_t *cache,
-                              char *destination, size_t destination_size) {
-  if (!cache || !destination || destination_size == 0) return false;
-  destination[0] = '\0';
-  for (uint8_t i = 0; i < cache->current_count; ++i) {
-    if (!luoye_live_append_text(destination, destination_size,
-                                cache->current[i].text)) return false;
-  }
-  return true;
-}
-
-bool luoye_live_query(char *out, size_t out_size, uint32_t after_revision,
-                      uint32_t after_display_revision,
-                      uint32_t after_caption_revision,
-                      uint32_t after_speaker_revision,
-                      uint32_t after_translation_revision,
-                      uint32_t after_summary_revision) {
+bool luoye_live_query(char *out, size_t out_size, uint32_t after_revision) {
   if (!out || out_size == 0) return false;
-  int length = snprintf(out, out_size,
-                        "?after_revision=%lu&include_partial=1&after_display_revision=%lu"
-                        "&after_caption_revision=%lu&after_speaker_revision=%lu"
-                        "&after_translation_revision=%lu&after_summary_revision=%lu",
-                        (unsigned long)after_revision,
-                        (unsigned long)after_display_revision,
-                        (unsigned long)after_caption_revision,
-                        (unsigned long)after_speaker_revision,
-                        (unsigned long)after_translation_revision,
-                        (unsigned long)after_summary_revision);
+  int length = snprintf(out, out_size, "?after_revision=%lu",
+                        (unsigned long)after_revision);
   return length > 0 && (size_t)length < out_size;
 }

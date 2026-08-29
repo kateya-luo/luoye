@@ -14,17 +14,18 @@ from .auth import CurrentUser, configure_auth, require_auth, router as auth_rout
 from .device_api_v1 import create_device_v2_router
 from .device_offline_pipeline import ready_asr_windows
 from .history_api import create_history_router
+from .minutes_service import MinutesService, create_minutes_router
 from .sessions_api import create_sessions_router
 from .speaker_diarizer import probe_speaker_backend
 from .ws_gateway import (router as ws_router, sessions, offline_queue, lifecycle,
-                         coverage, storage, device_rolling)
+                         coverage, storage, device_live, meeting_memory)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="ClearMeeting API", version="1.0.1")
+app = FastAPI(title="ClearMeeting API", version="0.21.0")
 configure_auth(storage)  # 绑定用户库并幂等创建 TEST1–TEST5
 _cors_origins = [origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
                  if origin.strip()]
@@ -37,6 +38,9 @@ app.add_middleware(CORSMiddleware, allow_origins=_cors_origins,
 app.include_router(ws_router)
 app.include_router(auth_router)
 app.include_router(create_history_router(storage, prefix="/api/v1/meetings"))
+minutes_service = MinutesService(storage, meeting_memory)
+app.include_router(create_minutes_router(storage, minutes_service, meeting_memory,
+                                         prefix="/api/v1"))
 app.include_router(create_sessions_router(sessions, storage=storage,
                                           prefix="/api/v1/sessions"))
 
@@ -69,45 +73,13 @@ def _covered_byte_ranges(session_id: str, total_bytes: int) -> list[tuple[int, i
     return merged
 
 
-def _ensure_device_meeting(session_id: str) -> bool:
-    """Rebuild a deleted meeting row when the recorder still owns authoritative audio."""
-    if storage.get_state(session_id) is not None:
-        return True
-    row = storage.db.query_one(
-        "SELECT owner_user_id,started_at_utc,title,source_language,target_language,status,"
-        "expected_samples,sample_rate FROM device_sessions WHERE server_session_id=?",
-        (session_id,))
-    if row is None:
-        return False
-    storage.create_meeting(
-        session_id, language=str(row["source_language"] or "auto"),
-        summary_language=str(row["target_language"] or "auto"),
-        owner_user_id=str(row["owner_user_id"]))
-    status = str(row["status"])
-    meeting_state = "done" if status in {"done", "cancelled"} else (
-        "finalizing" if status in {"processing", "failed"} else "recording")
-    end_ms = (int(row["expected_samples"] or 0) * 1000
-              // max(1, int(row["sample_rate"] or 16000)))
-    with storage.db.transaction() as conn:
-        conn.execute(
-            "UPDATE meetings SET created_at=?,title=?,state=?,audio_end_ms=?,updated_at=?"
-            " WHERE session_id=?",
-            (str(row["started_at_utc"]), row["title"], meeting_state,
-             end_ms or None, datetime.now(timezone.utc).isoformat(), session_id))
-    logging.getLogger("ai_recorder.device_pipeline").warning(
-        "device_meeting_metadata_rebuilt session_id=%s state=%s", session_id, meeting_state)
-    return True
-
-
-async def _schedule_device_asr(session_id: str, *, sealed: bool = False,
-                               recreate_missing: bool = False) -> None:
+async def _schedule_device_asr(session_id: str, *, sealed: bool = False) -> None:
     """把已校验字节覆盖的 5 分钟窗口投入持久队列。
 
     未 /complete 时只投完整窗口；最后不足 5 分钟的尾片必须等 complete 封口，避免
     服务器把尚未最终确认的尾部误当成完整录音。
     """
-    if storage.get_state(session_id) is None and not (
-            recreate_missing and _ensure_device_meeting(session_id)):
+    if storage.get_state(session_id) is None:
         logging.getLogger("ai_recorder.device_pipeline").warning(
             "device_asr_skip_missing_meeting session_id=%s", session_id)
         return
@@ -136,12 +108,12 @@ async def _schedule_device_asr(session_id: str, *, sealed: bool = False,
 
 
 async def _device_range_committed(session_id: str) -> None:
-    await _schedule_device_asr(session_id, sealed=False, recreate_missing=True)
+    await _schedule_device_asr(session_id, sealed=False)
 
 
 async def _device_session_complete(session_id: str, end_ms: int) -> None:
     """封闭尾片并追加持久化完成屏障；不再等待整场录音才开始转写。"""
-    if storage.get_state(session_id) is None and not _ensure_device_meeting(session_id):
+    if storage.get_state(session_id) is None:
         now = datetime.now(timezone.utc).isoformat()
         storage.db.execute(
             "UPDATE device_sessions SET status='failed',revision=revision+1,"
@@ -152,12 +124,15 @@ async def _device_session_complete(session_id: str, end_ms: int) -> None:
         logging.getLogger("ai_recorder.device_pipeline").error(
             "device_complete_missing_meeting session_id=%s", session_id)
         return
-    await device_rolling.finish_input(session_id)
+    await device_live.finish_input(session_id)
     coverage.add(session_id, 0, end_ms)
-    await _schedule_device_asr(session_id, sealed=True, recreate_missing=True)
+    await _schedule_device_asr(session_id, sealed=True)
     row = storage.db.query_one(
         "SELECT created_at FROM device_sessions WHERE server_session_id=?", (session_id,))
-    await offline_queue.enqueue(session_id, 0, 0, "summarize",
+    await offline_queue.enqueue(session_id, 0, 0, "canonical",
+                                order_key=str(row["created_at"] if row else "~"),
+                                chunk_index=2_147_483_646)
+    await offline_queue.enqueue(session_id, 0, 0, "publish",
                                 order_key=str(row["created_at"] if row else "~"),
                                 chunk_index=2_147_483_647)
 
@@ -168,9 +143,8 @@ device_v2_router = create_device_v2_router(
     on_audio_range_committed=_device_range_committed,
     offline_progress=lambda sid: {
         **offline_queue.progress(sid), "slice_ms": _offline_window_ms},
-    on_live_caption=device_rolling.on_caption,
-    on_live_partial=device_rolling.on_partial,
-    on_mark=device_rolling.on_mark,
+    on_live_caption=device_live.on_caption,
+    on_mark=device_live.on_mark,
 )
 device_v2_service = device_v2_router.device_service
 app.include_router(device_v2_router)
@@ -188,29 +162,8 @@ async def _v1_http_error(_request: Request, exc: HTTPException):
 
 @app.on_event("startup")
 async def _start_offline_worker():
-    # v0.20.1/0.20.2 曾把“设备会话仍在、meetings 行已被历史页删除”的完整录音
-    # 标为失败。权威 .b.pcm 仍在时自动重建元数据并重新投递全部切片。
-    for row in storage.db.query(
-            "SELECT server_session_id FROM device_sessions WHERE status='failed'"
-            " AND failure_code='MEETING_METADATA_MISSING'"):
-        session_id = row["server_session_id"]
-        audio_path = _data_dir / "audio_cache" / f"{session_id}.b.pcm"
-        if not audio_path.exists() or not _ensure_device_meeting(session_id):
-            continue
-        now = datetime.now(timezone.utc).isoformat()
-        with storage.db.transaction() as conn:
-            conn.execute(
-                "DELETE FROM offline_asr_jobs WHERE session_id=?", (session_id,))
-            conn.execute(
-                "UPDATE device_sessions SET status='processing',failure_code=NULL,"
-                "failure_message=NULL,updated_at=? WHERE server_session_id=?",
-                (now, session_id))
-            conn.execute(
-                "UPDATE meetings SET state='finalizing',updated_at=? WHERE session_id=?",
-                (now, session_id))
-        logging.getLogger("ai_recorder.device_pipeline").warning(
-            "device_missing_meeting_recovery_queued session_id=%s", session_id)
     offline_queue.start()
+    minutes_service.start()
     # 上传中的长录音可能在进程重启前已经具备多个完整 5 分钟窗口。
     for row in storage.db.query(
             "SELECT server_session_id FROM device_sessions"
@@ -236,8 +189,8 @@ async def _start_offline_worker():
 
 @app.on_event("shutdown")
 async def _stop_device_rolling_workers():
-    await device_v2_service.shutdown()
-    await device_rolling.shutdown()
+    await minutes_service.stop()
+    await device_live.shutdown()
     await offline_queue.stop()
 
 @app.get("/health")

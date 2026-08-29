@@ -1,5 +1,7 @@
 import React, {useEffect, useRef, useState, Component} from 'react';
 import CaptionStream from './CaptionStream';
+import ProcessingProgress from './ProcessingProgress';
+import {getMeetingProcessing} from './api';
 
 class ErrorBoundary extends Component {
   state = {error: null};
@@ -17,7 +19,7 @@ class ErrorBoundary extends Component {
   }
 }
 import {MeetingStatusBar, OfflineBanner, ReconnectAside, FooterBar} from './MeetingChrome';
-import {RollingMinutes, SummaryAside, ControlAside, NodeDetailAside, SmartMinutes, MeetingAssistAside} from './MeetingPanels';
+import {MeetingAssistAside} from './MeetingPanels';
 import {buildChapters, countWords, chapterCount, formatClock} from './summaryDerive';
 import {buildSpeakerDirectory, roleLabel} from './speakers';
 import {listMicrophones, startMicrophoneCapture} from './microphoneCapture';
@@ -37,15 +39,13 @@ function useIsMobile() {
 
 const MOBILE_SUBTABS = [
   {id: 'control', label: '会议控制'},
-  {id: 'summary', label: '实时摘要'},
   {id: 'captions', label: '实时字幕'},
-  {id: 'minutes', label: '滚动纪要'},
 ];
 
 const desktopServerUrl = window.clearMeetingDesktop?.serverUrl || '';
 const desktopWsBase = desktopServerUrl ? `${desktopServerUrl.replace(/^http/, 'ws').replace(/\/$/, '')}/ws` : '';
 const defaultWsBase = import.meta.env.VITE_WS_URL || desktopWsBase || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-const emptyResult = {summary: '会议进行中，滚动纪要将在识别到完整语句后出现。', decisions: [], action_items: [], mindmap: {title: '会议重点', branches: []}, speakers: [], speaker_roles: []};
+const emptyResult = {summary: '', decisions: [], action_items: [], mindmap: {title: '', branches: []}, speakers: [], speaker_roles: []};
 const createSessionId = () => globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function normalizeWsBase(value) {
@@ -60,7 +60,7 @@ function normalizeWsBase(value) {
   return url.toString().replace(/\/$/, '');
 }
 
-function MobileControlTab({recording, paused, online, elapsedSec, microphones, microphoneId, onMicChange, result, speakerEnabled, onSpeakerToggle, translateTo, onTranslateChange, onStart, onStop, onPause, onMark}) {
+function MobileControlTab({recording, paused, online, elapsedSec, microphones, microphoneId, onMicChange, result, processing, speakerEnabled, onSpeakerToggle, translateTo, onTranslateChange, onStart, onStop, onPause, onMark}) {
   const points = [
     ...(result?.decisions || []).map((text) => ({text, done: true})),
     ...(result?.action_items || []).map((t) => ({text: t.task, done: false})),
@@ -77,6 +77,7 @@ function MobileControlTab({recording, paused, online, elapsedSec, microphones, m
           {online ? <IconSignal /> : <IconWifiOff />}{online ? '网络正常' : '网络异常'}
         </div>
       </div>
+      <ProcessingProgress status={processing} />
 
       {/* 麦克风选择 */}
       <div className="mct-mic">
@@ -171,6 +172,8 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
   const [attempt, setAttempt] = useState(0);
   const [markers, setMarkers] = useState([]);
   const [savedAt, setSavedAt] = useState('');
+  const [processing, setProcessing] = useState(null);
+  const [awaitingProcessing, setAwaitingProcessing] = useState(false);
 
   const ws = useRef(null);
   const pipeline = useRef(null);
@@ -215,7 +218,7 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
     setIsFinal(final);
     setUpdatedAt(new Date().toLocaleTimeString('zh-CN', {hour12: false}));
     setSavedAt(new Date().toLocaleTimeString('zh-CN', {hour12: false}));
-    setStatus(final ? '处理完成' : '滚动纪要已更新');
+    setStatus(final ? '完整转写已保存，可在历史记录中选择模板生成纪要' : '字幕已更新');
     if (final) onMeetingSaved?.();
   };
 
@@ -233,16 +236,9 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
         });
         setPartial(''); setPartialSpeaker(null);
       } else {
-        setPartial((cur) => message.partial_replace ? (message.text || '') : `${cur}${message.text}`);
+        setPartial((cur) => `${cur}${message.text}`);
         setPartialSpeaker(message.speaker_id || null);
       }
-    }
-    if (message.type === 'segment_update' && message.seg_id) {
-      setLines((cur) => cur.map((line) => line.seg_id === message.seg_id ? {
-        ...line,
-        speakerId: message.speaker_id,
-        speakerLabel: message.speaker_label,
-      } : line));
     }
     if (message.type === 'translation') {
       // 实时翻译：按 seg_id 把译文挂到对应字幕行下
@@ -277,15 +273,14 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
         : [...cur, {seg_id: gid, startMs: message.start_ms, endMs: message.end_ms, text: '', state: 'filling'}]);
     }
     if (message.type === 'meeting_update') {
-      applyResult(message, false);
-      if (message.summary_stage === 'gap_merged') setStatus('断网补录内容已并入纪要');
+      // V0.21 录制期间不再生成滚动纪要。
     }
     if (message.type === 'meeting_result') {
-      const stage = message.summary_stage || message.result?.summary_stage || 'final';
-      // 初稿(draft)秒回、不算定稿；同一连接稍后会推 final 升级。pending=延迟定稿，本连接不再有 final。
-      applyResult(message, stage === 'final' || !!message.pending);
-      if (message.pending) setStatus('初稿已生成；断网段补录转写中，并入后自动更新（也可稍后在会议历史查看）');
-      else if (stage === 'draft') setStatus('纪要初稿已生成，最终版整理中…');
+      const ready = message.result?.state === 'transcript_ready' && !message.pending;
+      setIsFinal(ready);
+      setStatus(ready ? '完整转写已保存，可在历史记录中选择模板生成纪要' : '录音已保存，正在整理完整转写…');
+      setAwaitingProcessing(!ready);
+      if (ready) { setProcessing({active: false, stage: 'completed', progress_percent: 100}); onMeetingSaved?.(); }
     }
     if (message.type === 'error') setStatus(`服务端错误：${message.message}`);
   };
@@ -336,6 +331,7 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
       setSessionId(nextSessionId);
       setLines([]); setPartial(''); setPartialSpeaker(null); setResult(emptyResult);
       setIsFinal(false); setUpdatedAt(''); setMarkers([]); setElapsedSec(0);
+      setProcessing(null); setAwaitingProcessing(false);
       intentionalClose.current = false; pausedRef.current = false; setPaused(false);
       startedAt.current = Date.now();
       ws.current && (intentionalClose.current = true, ws.current.close());
@@ -379,7 +375,8 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
     uploader.current?.finish();   // 通道B：标记最后一片 final；积压在后台继续传，不阻塞结束
     // 立刻发 meeting_end（趁 WS 还活着）——让服务器明确知道是"主动结束"，不会误挂起等 2 小时重连。
     // 断网补传的音频在后台继续上传，服务器 defer_finalize 会等 final 音频到齐后再出最终纪要，一个字不丢。
-    setStatus('正在等待最终识别与纪要…');
+    setStatus('正在保存录音并整理完整转写…');
+    setAwaitingProcessing(true);
     try { ws.current?.send(JSON.stringify({type: 'meeting_end'})); } catch {}
     // HTTP 兜底（幂等）：WS 已死/僵尸时结束信号也能送达，彻底杜绝"挂起等 2 小时才出纪要"。
     // WS 看似正常时延迟 4 秒再发（服务端若已在处理会直接忽略）；WS 明显已断则立即发。
@@ -389,6 +386,30 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
     if (ws.current?.readyState === WebSocket.OPEN) window.setTimeout(fireHttpEnd, 4000);
     else fireHttpEnd();
   };
+
+  useEffect(() => {
+    if (!awaitingProcessing || recording || !sessionId) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const next = await getMeetingProcessing(sessionId, token);
+        if (cancelled) return;
+        setProcessing(next);
+        setStatus(next.title || '后台处理中');
+        if (next.stage === 'completed') {
+          setAwaitingProcessing(false);
+          setIsFinal(true);
+          onMeetingSaved?.();
+        } else if (['failed', 'stalled'].includes(next.stage)) {
+          setAwaitingProcessing(false);
+          setIsFinal(false);
+        }
+      } catch { /* meeting creation and the end signal may cross by a few milliseconds */ }
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [awaitingProcessing, recording, sessionId, token]);
 
   const togglePause = () => { pausedRef.current = !pausedRef.current; setPaused(pausedRef.current); setStatus(pausedRef.current ? '已暂停' : '录音中'); };
   const mark = () => { const last = lines.at(-1); setMarkers((m) => [...m, {ts: Date.now(), text: last?.text || ''}]); };
@@ -431,7 +452,7 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
             <MobileControlTab
               recording={recording} paused={paused} online={online} elapsedSec={elapsedSec}
               microphones={microphones} microphoneId={microphoneId} onMicChange={setMicrophoneId}
-              result={result} speakerEnabled={speakerEnabled} onSpeakerToggle={setSpeakerEnabled}
+              result={result} processing={processing} speakerEnabled={speakerEnabled} onSpeakerToggle={setSpeakerEnabled}
               translateTo={translateTo} onTranslateChange={(v) => { setTranslateTo(v); translateRef.current = v; }}
               {...controls}
             />
@@ -440,11 +461,9 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
       );
     }
 
-    // 录音tab：3个内容subtab（字幕/摘要/纪要）
+    // 录音过程中只显示实时转写，纪要在会后按模板生成。
     const CONTENT_TABS = [
       {id: 'captions', label: '实时字幕'},
-      {id: 'summary', label: '实时摘要'},
-      {id: 'minutes', label: '滚动纪要'},
     ];
     return (
       <ErrorBoundary>
@@ -452,6 +471,7 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
         <MeetingStatusBar recording={recording} paused={paused} elapsedSec={elapsedSec}
           title={meetingTitle} microphones={microphones} microphoneId={microphoneId}
           onMicChange={setMicrophoneId} online={online} level={level} />
+        <ProcessingProgress status={processing} />
 
         <div className="subtabs mobile-subtabs">
           {CONTENT_TABS.map((t) => (
@@ -475,43 +495,25 @@ export default function MeetingView({token, onMeetingSaved, onCloud, controlMode
               </div>
             </section>
           )}
-          {mobileTab === 'summary' && (
-            <section className="panel">
-              <SummaryAside result={result} stats={stats} directory={directory} updatedAt={updatedAt} />
-            </section>
-          )}
-          {mobileTab === 'minutes' && (
-            <section className="panel">
-              <div className="panel-head">
-                <h2>滚动纪要</h2>
-                {recording && online ? <span className="live-dot">自动更新中</span> : <span className="meta">本地记录中</span>}
-              </div>
-              <div className="panel-body">
-                <RollingMinutes chapters={chapters} summary={result.summary} />
-              </div>
-            </section>
-          )}
         </div>
       </div>
       </ErrorBoundary>
     );
   }
 
-  // ── 桌面端：固定三栏布局（字幕 | 智能纪要 | 会议助手）──
+  // ── 桌面端：录制期只保留字幕与控制，不生成纪要。──
   return (
     <div className="app-root" style={{height: '100%'}}>
       <MeetingStatusBar recording={recording} paused={paused} elapsedSec={elapsedSec}
         title={meetingTitle} microphones={microphones} microphoneId={microphoneId}
         onMicChange={setMicrophoneId} online={online} level={level} />
+      <ProcessingProgress status={processing} />
 
       {!online && <OfflineBanner offlineSec={offlineSec} attempt={attempt} queued={queued} />}
 
       <div className="scroll-area">
-        <div className="cols c-3b">
+        <div className="cols c-2">
           <CaptionsPanel />
-          <section className="panel">
-            <SmartMinutes result={result} chapters={chapters} updatedAt={updatedAt} />
-          </section>
           <section className="panel">
             {online
               ? <MeetingAssistAside result={result} controls={controls} stats={stats} online={online} savedAt={savedAt} speakerEnabled={speakerEnabled} onSpeakerToggle={setSpeakerEnabled}

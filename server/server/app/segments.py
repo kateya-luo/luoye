@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Iterable, Literal
 
 SegState = Literal["provisional", "filling", "final"]
-SegSource = Literal["live", "offline", "gap"]
+SegSource = Literal["live", "offline", "offline_canonical", "gap"]
 
 
 def _new_id() -> str:

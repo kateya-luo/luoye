@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -62,6 +63,22 @@ class TestMeetingEndHttp(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(r2.json()["state"], "finalizing")
+
+    def test_browser_canonical_result_does_not_require_device_session(self):
+        sid = "d1b2c3d4e5f60718a1b2c3d4e5f60718"
+        ws_gateway.storage.create_meeting(sid)
+        ws_gateway.storage.set_audio_end(sid, 2000)
+        ws_gateway.storage.set_speaker_diarization(sid, False)
+        asyncio.run(ws_gateway._on_canonical_finalized(sid, {
+            "pipeline_version": "test-canonical-v2",
+            "canonical_sha256": "",
+            "segments": [{"start_ms": 0, "end_ms": 1800, "text": "网页在线会议定稿",
+                          "speaker_id": "speaker_0"}],
+        }))
+        segments = ws_gateway.storage.load_segments(sid)
+        self.assertEqual([item["text"] for item in segments], ["网页在线会议定稿"])
+        self.assertIsNone(segments[0]["speaker_id"])
+        self.assertEqual(segments[0]["source"], "offline_canonical")
 
 
 if __name__ == "__main__":

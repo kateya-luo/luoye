@@ -15,8 +15,8 @@ const configuredServer = window.clearMeetingDesktop?.serverUrl || '';
 
 const FEATURES = [
   {icon: <IconCaptions />, title: '实时字幕', desc: 'AI 实时语音转文字，准确稳定，多语言支持。'},
-  {icon: <IconMinutes />, title: '滚动纪要', desc: '智能提炼要点，滚动生成纪要，不错过任何关键信息。'},
-  {icon: <IconMindmap />, title: '思维导图', desc: '一键生成思维导图，梳理观点结构，激发团队思考。'},
+  {icon: <IconMinutes />, title: '模板纪要', desc: '会议完整转写后再按需生成，减少模型费用。'},
+  {icon: <IconMindmap />, title: '会议记忆', desc: '记住经确认的人员、别名和项目信息，越用越准。'},
 ];
 
 export default function LoginScreen({onLogin}) {
@@ -77,7 +77,7 @@ export default function LoginScreen({onLogin}) {
               </div>
             ))}
             <div className="footnote">
-              <a href="#">{isDesktop ? 'Windows Client' : 'Web Client'} V0.19.2</a>
+              <a href="#">{isDesktop ? 'Windows Client' : 'Web Client'} V0.21.0</a>
               <div>© 2026 CLEAR MEETING. All rights reserved.</div>
             </div>
           </div>

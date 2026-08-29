@@ -1,35 +1,53 @@
 # 落叶（Luoye）录音卡
 
-落叶录音卡是一套以 ESP32-S3、电子墨水屏和 ClearMeeting 服务为核心的录音、实时字幕、离线上传与会议整理系统。本仓库把固件、服务器、PCB 与机械结构放在同一版本基线中，便于协同开发和追踪兼容关系。
+落叶是一套以 ESP32-S3、1.54 英寸电子墨水屏、双麦克风和 microSD 为核心的录音卡系统。设备负责可靠录音、离线保存、实时字幕显示与断点补传；ClearMeeting 负责转写、多人识别、会议纪要、待办和网页管理。
 
-## 当前基线
+## 项目预览
+
+| 落叶录音卡 | ClearMeeting 会议纪要 |
+| :---: | :---: |
+| <img src="docs/images/luoye-device-sync.png" alt="落叶录音卡同步界面" width="360"> | <img src="docs/images/clearmeeting-minutes.png" alt="ClearMeeting 会议纪要界面" width="720"> |
+| 电子墨水屏显示录音、同步、电量、时间、待办与提醒 | 可靠音频完成后生成规范转写，并按模板整理会议纪要 |
+
+## 当前兼容基线
 
 | 组件 | 版本/标识 | 说明 |
 | --- | --- | --- |
-| 固件 | `2.3.2` | ESP-IDF 5.5.4，工程固件 |
-| 服务器 | `1.0.1` | ClearMeeting 服务端与 Web 界面 |
+| 固件 | `1.7.0 R2` | ESP-IDF 5.5.4，单任务上传与精确 SDSPI DMA 路径 |
+| 服务器 | `0.21.0 R9` | ClearMeeting 服务端、Web 前端与后台处理进度 |
 | 设备 API | `luoye-device-api/2` | 固件与服务器的兼容边界 |
-| 硬件 | `LY-HW-ENG-20260710` | 当前工程样机基线，尚未形成量产归档 |
+| 硬件 | `LY-HW-ENG-20260710` | 当前工程样机，尚未形成量产归档 |
 
-兼容说明见 [发布兼容矩阵](docs/RELEASE_COMPATIBILITY.md)。
+详细变化和验证要求见 [发布兼容矩阵](docs/RELEASE_COMPATIBILITY.md)。
 
-## 仓库结构
+## 主要能力
 
-```text
-firmware/             ESP32-S3 固件源码、烧录和诊断工具
-server/               ClearMeeting 服务端、Web 前端与部署文件
-hardware/pcb/         PCB 工程、BOM 和装配 STEP
-hardware/mechanical/  外壳机械 STEP
-docs/                 跨组件版本、制造与发布说明
-scripts/              仓库发布前审计脚本
-```
+- 双 PDM 麦克风录音，16 kHz 单声道 PCM/WAV 先落 microSD。
+- 断网、重启和手动退出后按服务器缺口继续补传，逻辑范围保持 10 MiB。
+- 电子墨水屏显示时钟、电量、录音状态、字幕、议程、提醒和语音待办。
+- ClearMeeting 提供实时转写、整场离线规范化、多人识别和模板化会议纪要。
+- 设备与网页共享账号隔离、幂等会话、SD 管理和后台处理状态。
+- 固件、服务器、PCB 与机械结构在同一仓库记录兼容关系。
 
 ## 数据流
 
 ```text
-麦克风/SD 卡 → ESP32-S3 固件 → luoye-device-api/2 → ClearMeeting
-                  ↓                         ↓
-              电子墨水屏              实时字幕/转录/待办
+双麦克风 → ESP32-S3 → microSD/WAV → luoye-device-api/2 → ClearMeeting
+               ↓                              ↓
+          电子墨水屏                    转写 / 多人识别
+                                             ↓
+                                      纪要 / 待办 / 导出
+```
+
+## 仓库结构
+
+```text
+firmware/             ESP32-S3 固件源码、构建检查和诊断工具
+server/               ClearMeeting 服务端、Web 前端与部署文件
+hardware/pcb/         PCB 工程、BOM 和装配模型
+hardware/mechanical/  外壳机械文件
+docs/                 跨组件版本、制造与发布说明
+scripts/              发布前仓库审计
 ```
 
 ## 快速开始
@@ -37,21 +55,19 @@ scripts/              仓库发布前审计脚本
 - 固件编译、烧录和串口诊断：[firmware/README.md](firmware/README.md)
 - 服务器部署与验证：[server/README.md](server/README.md)
 - PCB 与机械资料：[hardware/README.md](hardware/README.md)
-- 第一次发布前检查：[docs/GITHUB_PUBLISH_CHECKLIST.md](docs/GITHUB_PUBLISH_CHECKLIST.md)
+- GitHub 发布前检查：[docs/GITHUB_PUBLISH_CHECKLIST.md](docs/GITHUB_PUBLISH_CHECKLIST.md)
 
 ## 版本和发布
 
-源码提交中不放烧录包、服务端压缩包、运行数据库、录音或密钥。已验证的二进制包应作为 GitHub Release 附件上传，并建议分别使用组件标签：
+源码仓库不提交烧录包、服务端压缩包、数据库、录音或密钥。二进制发布附件使用独立组件标签：
 
-- `firmware-v2.3.2`
-- `server-v1.0.1`
+- `firmware-v1.7.0`
+- `server-v0.21.0`
 
-本地候选附件保存在被忽略的 `.github-release-assets/` 目录中，不会进入 Git 历史。
+固件当前仍按 Engineering 版本发布。正式量产前必须完成真机长录音、跨 10 MiB 边界、上传中断恢复、SD 故障和重复复位验证。
 
-## 工程状态
+## 工程边界
 
-当前硬件资料属于工程样机，不等于可直接投产的制造包。PCB 工程、BOM、装配 STEP 和外壳 STEP 的导出日期并不完全一致；生产前必须完成 [制造归档检查](docs/MANUFACTURING_STATUS.md)。
-
-## 许可
-
-当前尚未选择开源许可证。在许可证文件正式加入仓库前，代码和设计资料默认保留全部权利。若仓库计划公开，请先确认自研代码、字体、器件库和第三方模型/依赖的再分发权利。
+- 当前硬件资料属于工程样机；PCB、BOM、装配 STEP 和外壳 STEP 尚未完全锁版，生产前必须完成 [制造归档检查](docs/MANUFACTURING_STATUS.md)。
+- 工程部署仍可显式使用 HTTP；真实账号、设备令牌和真实录音必须改用 HTTPS。
+- 当前未选择开源许可证。在加入 `LICENSE` 前，代码和设计资料默认保留全部权利。

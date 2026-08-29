@@ -23,14 +23,12 @@ foreach ($bin in $bins) {
 foreach ($required in @(
     'epd_ssd1681.h', 'EPD_FB_BYTES',
     'epd_frame_fast', 'BW-FAST',
-    'ui154_layout_generated.h', 'load_layout_page', 'screen_live_timeline',
-    'unified_caption_text', 'live_ticker_hash',
+    'ui154_layout_generated.h', 'load_layout_page', 'layout_draw_field_latest',
     '05_meeting_caption', '15_pair_hotspot', '22_storage_error',
     'LY|UI_RECORD|refresh=',
-    'RECORD_FAST_INTERVAL_SECONDS', 'LIVE_TICKER_HEIGHT',
-    'APP_RENDER_RECORD_LIVE_PARTIAL',
+    'seconds / 5', 'five_second % 60', 'periodic_fast',
     'render_once_panel', 'epd_frame_fast',
-    'epd_frame_partial_window(s_fb, LIVE_TICKER_X, LIVE_TICKER_Y')) {
+    'epd_frame_partial_window(s_fb, 4, 8, 192, 171)')) {
     if ($ui -notmatch [regex]::Escape($required)) { throw "UI missing: $required" }
 }
 if ($manifest.pages.Count -ne 23) { throw "Manifest page count mismatch: $($manifest.pages.Count)" }
@@ -87,11 +85,11 @@ foreach ($required in @('PIN_KEY_MARK', 'APP_EV_KEY_MARK_RELEASE', 'has_release 
     if ($keys -notmatch [regex]::Escape($required)) { throw "Todo-key release flow missing: $required" }
 }
 foreach ($required in @('APP_EV_KEY_MARK_RELEASE', 'todo_hold()', 'todo_release()',
-                         'APP_MARK_IMPORTANT')) {
+                         'Long MARK used to switch to the rolling-minutes page')) {
     if ($state -notmatch [regex]::Escape($required)) { throw "MARK todo flow missing: $required" }
 }
-if (($state + $ui) -match 'record_view|APP_RECORD_VIEW_') {
-    throw 'Recording still toggles between caption and timeline pages'
+if (($ui + $state) -match 'APP_RECORD_VIEW_TIMELINE|record_view') {
+    throw 'Transcript-only recording UI still exposes the removed rolling-minutes view.'
 }
 
 [pscustomobject]@{
@@ -107,7 +105,7 @@ if (($state + $ui) -match 'record_view|APP_RECORD_VIEW_') {
     RecordKey = 'tap=record/pause; hold=sync standby/end recording'
     TodoKey = 'tap=agenda/mark/confirm; hold-and-release=voice todo'
     SettingsKey = 'tap=status/back; hold=pair/lock/snooze'
-    RecordingRefresh = 'one-line latest-suffix ticker; summaries only on 1min FAST; header every 5s'
+    RecordingRefresh = 'window PARTIAL every 5s; whole-panel FAST every 5min'
     LayoutSha256 = $manifest.layout_sha256
     Result = 'PASS'
 }

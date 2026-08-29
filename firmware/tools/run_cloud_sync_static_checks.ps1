@@ -5,7 +5,10 @@ $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $net = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\net_uploader\net_uploader.c') -Raw
 $store = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\storage_sd\upload_store.c') -Raw
+$storeHeader = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\storage_sd\include\upload_store.h') -Raw
 $storage = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\storage_sd\storage_sd.c') -Raw
+$sdspi = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\esp_driver_sdspi\src\sdspi_host.c') -Raw
+$spiMaster = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\esp_driver_spi\src\gpspi\spi_master.c') -Raw
 $protocol = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'components\net_uploader\upload_protocol.c') -Raw
 $defaults = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'sdkconfig.defaults') -Raw
 $engineering = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $project 'sdkconfig.ui154') -Raw
@@ -35,27 +38,22 @@ foreach ($required in @('/api/v2/build-info', '/api/v2/device/pair/start',
                          'event=range_http result=%s',
                          'sd_read_ms=%llu', 'sha_ms=%llu',
                          'write_ms=%llu', 'effective_Bps=%llu',
-                         'HTTP_TX_BUFFER_BYTES (8U * 1024U)',
+                         'HTTP_TX_BUFFER_BYTES (16U * 1024U)',
                          'stream_range_serial',
                          'mode=serial',
                          'source=%s',
-                         'bulk_wifi_ps_update((s_manual_sync || s_live_session_id[0]) && s_online)',
+                         'bulk_wifi_ps_update(s_manual_sync && s_online)',
                          'esp_wifi_set_ps(WIFI_PS_NONE)',
                          'esp_wifi_set_ps(s_bulk_saved_wifi_ps)',
                          'LY|UPLOAD_WIFI_PS|state=performance',
                          'LY|UPLOAD_WIFI_PS|state=restored',
-                         'LIVE_CHECKPOINT_CHUNKS 8U',
-                         'LIVE_CHECKPOINT_MS    8000',
-                         'LY|LIVE_UPLOAD_DIAG|id=%s',
-                         'sd_upload_reader_read',
-                         '.keep_alive_enable = true',
                          'sd_storage_delete_all_local')) {
     if ($net -notmatch [regex]::Escape($required)) {
         throw "Cloud uploader is missing required contract element: $required"
     }
 }
 
-foreach ($required in @('CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768',
+foreach ($required in @('CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535',
                          'CONFIG_LWIP_TCP_WND_DEFAULT=32768',
                          'CONFIG_LWIP_TCP_RECVMBOX_SIZE=24',
                          'CONFIG_LWIP_TCP_SACK_OUT=y')) {
@@ -79,29 +77,95 @@ foreach ($required in @('remote_session_created', 'next_seq', 'acked_pcm_bytes',
         throw "Persistent upload state is missing: $required"
     }
 }
-foreach ($required in @('sd_upload_refresh_current', 'sd_upload_reader_close',
-                         'reader->file_offset', 'storage_sd_seek(reader->file')) {
-    if ($store -notmatch [regex]::Escape($required)) {
-        throw "Sequential live reader/checkpoint support is missing: $required"
-    }
-}
 foreach ($required in @('sd_upload_range_sha256', 'SD_UPLOAD_RANGE_HASH_FILE',
                          'SD_UPLOAD_RANGE_BLOCK_BYTES')) {
     if (($store + $net) -notmatch [regex]::Escape($required)) {
         throw "Precomputed range SHA support is missing: $required"
     }
 }
+if ($storeHeader -notmatch '(?m)^#define\s+SD_UPLOAD_RANGE_BLOCK_BYTES\s+\(10U\s*\*\s*1024U\s*\*\s*1024U\)\s*$') {
+    throw 'API/2 range size must remain exactly 10 MiB.'
+}
 foreach ($required in @('SD_SPI_FREQUENCY_KHZ SDMMC_FREQ_DEFAULT',
                          'sd_speed_probe',
                          'range_sha_disable', 'upload_fallback=scan',
                          'SD_DMA_READ_BYTES (16U * 1024U)',
-                         'SD_DMA_LOW_WATER_BYTES (8U * 1024U)',
-                         'wait_for_sd_dma_headroom',
-                         'LY|STORAGE_DMA|event=backpressure',
-                         'LY|STORAGE_DMA|event=policy mode=direct')) {
+                         'MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT',
+                         'LY|STORAGE_DMA|event=reserved')) {
     if ($storage -notmatch [regex]::Escape($required)) {
         throw "Safe SD/SHA performance fallback is missing: $required"
     }
+}
+foreach ($required in @('SDSPI_BLOCK_BUF_SIZE    (SDSPI_MAX_DATA_LEN + 4)',
+                         'SDSPI_DMA_ALIGNMENT     4',
+                         'heap_caps_aligned_alloc(SDSPI_DMA_ALIGNMENT',
+                         'MALLOC_CAP_INTERNAL |',
+                         'MALLOC_CAP_DMA',
+                         '.flags = SPI_TRANS_DMA_BUFFER_ALIGN_MANUAL',
+                         '.length = receive_bytes * 8',
+                         'if (extra_data_size > expected_data_size)',
+                         'pre_scan_data_size = receive_extra_bytes - sizeof(crc)',
+                         'LY|SDSPI_DMA|mode=aligned_static_exact_wire')) {
+    if (-not $sdspi.Contains($required)) {
+        throw "Project-local SDSPI exact-wire DMA fix is missing: $required"
+    }
+}
+$lookAheadCopy = $sdspi.IndexOf('memcpy(data, extra_data_ptr, extra_data_size);')
+$dmaClear = $sdspi.IndexOf('memset(rx_data, 0xff, SDSPI_BLOCK_BUF_SIZE);')
+if ($lookAheadCopy -lt 0 -or $dmaClear -lt 0 -or $lookAheadCopy -gt $dmaClear) {
+    throw 'SDSPI look-ahead byte must be copied before reusing the DMA block buffer.'
+}
+if ($sdspi.Contains('dma_receive_bytes') -or
+    $sdspi.Contains('.length = SDSPI_BLOCK_BUF_SIZE * 8')) {
+    throw 'SDSPI must never pad the actual SPI wire transaction length.'
+}
+foreach ($required in @('LUOYE_SPI_EXACT_LENGTH_DMA_BACKPORT',
+                         'host->bus_attr->cache_align_int > 1',
+                         '? (((uint32_t)buffer | len) & (alignment - 1))',
+                         ': (((uint32_t)buffer) & (alignment - 1))',
+                         'LUOYE_V230_SPI_OOM_GUARD')) {
+    if (-not $spiMaster.Contains($required)) {
+        throw "Project-local SPI DMA backport is missing: $required"
+    }
+}
+for ($extra = 0; $extra -lt 8; $extra++) {
+    $willReceive = 512 - $extra
+    $middleWireBytes = $willReceive + 4
+    $finalWireBytes = $willReceive + 2
+    $middleDescriptorBytes = [int](($middleWireBytes + 3) -band (-bnot 3))
+    $finalDescriptorBytes = [int](($finalWireBytes + 3) -band (-bnot 3))
+    if ($middleWireBytes -gt 516 -or $finalWireBytes -gt 514 -or
+        $middleDescriptorBytes -gt 516 -or $finalDescriptorBytes -gt 516) {
+        throw "SDSPI exact-wire/DMA-capacity bound invalid for extra_data_size=$extra"
+    }
+}
+if ((512 + 2) -ne 514) {
+    throw 'Final SDSPI block invariant is not 512 data + 2 CRC = 514 bytes.'
+}
+foreach ($required in @('STORAGE_RUNTIME_READY', 'STORAGE_RUNTIME_FAULTED',
+                         'LY|STORAGE_FAULT|', 'action=block_runtime_io',
+                         'storage_sd_report_io_fault',
+                         'event=probe_cleanup_skipped reason=storage_fault')) {
+    if (($storage + $store) -notmatch [regex]::Escape($required)) {
+        throw "Unified storage fault guard is missing: $required"
+    }
+}
+$schedulerStart = $net.IndexOf('bulk_wifi_ps_update(s_manual_sync && s_online);')
+$schedulerFaultGate = $net.IndexOf('if (storage_sd_faulted()) {', $schedulerStart)
+$schedulerBacklog = $net.IndexOf('if (now_ms >= next_backlog_ms) {', $schedulerStart)
+if ($schedulerStart -lt 0 -or $schedulerFaultGate -lt 0 -or
+    $schedulerBacklog -lt 0 -or $schedulerFaultGate -gt $schedulerBacklog) {
+    throw 'Uploader must gate a latched storage fault before backlog scanning.'
+}
+foreach ($required in @('history_scan == ESP_ERR_NOT_FOUND',
+                         'reason=local_scan', 'local_ack=unchanged',
+                         'keep_last=1')) {
+    if ($net -notmatch [regex]::Escape($required)) {
+        throw "Tri-state manual-sync completion guard is missing: $required"
+    }
+}
+if ($storage -match 'esp_vfs_fat_sdcard_unmount') {
+    throw 'Runtime storage fault handling must not hot-unmount or remount the card.'
 }
 foreach ($required in @('xTaskCreateWithCaps(upload_task',
                          'MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT',
@@ -122,21 +186,21 @@ if ($storage -match 'SDMMC_FREQ_HIGHSPEED' -or
     $storage -match 'LY\|STORAGE_PERF\|event=fallback') {
     throw 'SD SPI must stay fixed at 20 MHz without a 40 MHz first attempt.'
 }
-if ($storage -match 's_dma_read_buffer') {
-    throw 'Obsolete internal SD staging must not consume DMA headroom.'
+if ($storage -match 'fread\s*\(\s*s_dma_read_buffer') {
+    throw 'Reserved SD DMA reads must bypass the hidden stdio FILE buffer.'
 }
 foreach ($required in @('fileno(file)',
-                         'read(fd, destination + *received, chunk)')) {
+                         'read(fd, s_dma_read_buffer, chunk)')) {
     if (-not $storage.Contains($required)) {
-        throw "Direct VFS SD read protection is missing: $required"
+        throw "Direct VFS-to-DMA SD read protection is missing: $required"
     }
 }
 foreach ($source in @($net, $store)) {
     if ($source -match 'fread\(') {
-        throw 'Uploader SD reads must use storage_sd_read low-water backpressure.'
+        throw 'Uploader SD reads must use the reserved internal DMA staging buffer.'
     }
     if ($source -notmatch 'storage_sd_read\(') {
-        throw 'Uploader is missing low-water protected SD reads.'
+        throw 'Uploader is missing internal DMA-staged SD reads.'
     }
 }
 if ($net -match '2U\s*\*\s*1024U\s*\*\s*1024U') {

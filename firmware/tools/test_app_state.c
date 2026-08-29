@@ -8,7 +8,7 @@ static int64_t now;
 static struct { bool armed; int64_t at; } timers[APP_TIMER_COUNT];
 static int renders, starts, stops, marks, pair_in, pair_out, power_on_count, power_off_count;
 static int todo_starts, todo_ends, todo_actions, reminder_actions;
-static int sync_requests, agenda_requests, storage_format_requests;
+static int sync_requests, agenda_requests;
 static app_render_t last_render;
 static bool todo_capture_ok = true, todo_action_ok = true, last_todo_confirm;
 static bool sync_request_ok = true;
@@ -65,7 +65,6 @@ static void set_timer(app_timer_id_t id, uint32_t ms) {
   timers[id].at = now + ms;
 }
 static void cancel_timer(app_timer_id_t id) { timers[id].armed = false; }
-static bool storage_format(void) { storage_format_requests++; return true; }
 
 static void advance(int64_t ms) {
   int64_t end = now + ms;
@@ -115,7 +114,6 @@ int main(void) {
     .recording_close_status = close_status,
     .set_timer = set_timer,
     .cancel_timer = cancel_timer,
-    .storage_format = storage_format,
   };
   app_state_init(&hooks);
   CHECK(ST->mode == APP_MODE_STANDBY);
@@ -134,6 +132,34 @@ int main(void) {
   EV(APP_EV_TIME_SYNC);
   CHECK(renders == renders_before_home_time + 1 &&
         last_render == APP_RENDER_CLOCK_PARTIAL);
+
+  /* The charging page repaints only when entering/leaving charging or when
+     the displayed percentage crosses a five-percent bucket.  Charge Done is
+     coalesced with the following 100% event to avoid two FAST flashes. */
+  app_state_handle(APP_EV_BATTERY, 82);
+  int renders_before_charge = renders;
+  app_state_handle(APP_EV_CHARGE_CHANGE, APP_CHG_CHARGING);
+  CHECK(renders == renders_before_charge + 1 &&
+        last_render == APP_RENDER_FAST);
+  int renders_before_charge_percent = renders;
+  app_state_handle(APP_EV_BATTERY, 83);
+  app_state_handle(APP_EV_BATTERY, 84);
+  CHECK(renders == renders_before_charge_percent);
+  app_state_handle(APP_EV_BATTERY, 85);
+  CHECK(renders == renders_before_charge_percent + 1 &&
+        last_render == APP_RENDER_FAST);
+  int renders_before_full = renders;
+  app_state_handle(APP_EV_CHARGE_CHANGE, APP_CHG_FULL);
+  CHECK(renders == renders_before_full);
+  app_state_handle(APP_EV_BATTERY, 100);
+  CHECK(renders == renders_before_full + 1 &&
+        last_render == APP_RENDER_FAST);
+  int renders_before_unplug = renders;
+  app_state_handle(APP_EV_CHARGE_CHANGE, APP_CHG_NONE);
+  CHECK(renders == renders_before_unplug + 1 &&
+        last_render == APP_RENDER_FAST);
+  app_state_handle(APP_EV_BATTERY, 80);
+
   int renders_before_hidden_network = renders;
   app_state_handle(APP_EV_NET_CHANGE, 0);
   CHECK(!ST->online && renders == renders_before_hidden_network);
@@ -200,31 +226,25 @@ int main(void) {
   EV(APP_EV_SESSION_SETTLED);
   EV(APP_EV_KEY_BACK_SHORT);
 
-  /* Critical battery initiates the same safe drain-and-close path. */
+  /* Display percentage never blocks use or stops an active recording.  Only
+     the power manager's debounced physical-voltage emergency closes safely. */
   app_state_handle(APP_EV_BATTERY, 80);
   EV(APP_EV_KEY_REC_SHORT);
   app_state_handle(APP_EV_BATTERY, 3);
+  CHECK(ST->mode == APP_MODE_RECORDING && ST->battery == 3);
+  app_state_handle(APP_EV_BATTERY, 0);
+  CHECK(ST->mode == APP_MODE_RECORDING && ST->battery == 0);
+  app_state_handle(APP_EV_BATTERY_CRITICAL, 2995);
   CHECK(ST->mode == APP_MODE_CLOSING);
   CHECK(last_close_reason == APP_CLOSE_LOW_BATTERY);
   EV(APP_EV_SESSION_CLOSE_DONE);
   advance(3200);
 
-  /* Below 5% a new recording is rejected with a specific page. */
-  app_state_handle(APP_EV_BATTERY, 4);
+  /* Even a displayed 0% can start recording; voltage, not percentage, owns
+     the final data-integrity boundary. */
   EV(APP_EV_KEY_REC_SHORT);
-  CHECK(ST->mode == APP_MODE_STORAGE_ERROR &&
-        ST->error == APP_ERR_LOW_BATTERY);
-  EV(APP_EV_KEY_BACK_SHORT);
-  CHECK(ST->battery_low_latched);
-  app_state_handle(APP_EV_BATTERY, 6);
-  CHECK(ST->battery_low_latched); /* hysteresis prevents threshold chatter */
-  app_state_handle(APP_EV_BATTERY, 8);
-  CHECK(!ST->battery_low_latched);
-  app_state_handle(APP_EV_BATTERY, 4);
-  CHECK(ST->battery_low_latched);
-  app_state_handle(APP_EV_CHARGE_CHANGE, APP_CHG_CHARGING);
-  CHECK(!ST->battery_low_latched); /* external power immediately unlocks */
-  app_state_handle(APP_EV_CHARGE_CHANGE, APP_CHG_NONE);
+  CHECK(ST->mode == APP_MODE_RECORDING && ST->battery == 0);
+  close_successfully();
   app_state_handle(APP_EV_BATTERY, 80);
 
   /* WiFi reachability and cloud/API readiness are distinct states. */
@@ -287,9 +307,11 @@ int main(void) {
   advance(2500);
   CHECK(ST->mode == APP_MODE_STANDBY && ST->pairing == APP_PAIR_BOUND);
 
-  /* Todo-key hold/release captures a standalone voice todo. */
+  /* A displayed 0% also leaves standalone voice-todo capture available. */
+  app_state_handle(APP_EV_BATTERY, 0);
   EV(APP_EV_KEY_MARK_HOLD);
-  CHECK(ST->overlay == APP_OV_TODO_LISTEN && todo_starts == 1);
+  CHECK(ST->overlay == APP_OV_TODO_LISTEN && todo_starts == 1 &&
+        ST->battery == 0);
   advance(1200);
   CHECK(app_state_todo_elapsed_ms() == 1200);
   EV(APP_EV_RTC_ALARM);
@@ -300,6 +322,7 @@ int main(void) {
   CHECK(ST->overlay == APP_OV_REMINDER && !ST->reminder_pending);
   EV(APP_EV_KEY_BACK_SHORT);
   CHECK(ST->overlay == APP_OV_NONE);
+  app_state_handle(APP_EV_BATTERY, 80);
   app_state_handle(APP_EV_TODO_RESULT, 1);
   CHECK(ST->overlay == APP_OV_TODO_CONFIRM);
   EV(APP_EV_KEY_MARK_SHORT);
@@ -309,17 +332,20 @@ int main(void) {
   EV(APP_EV_KEY_BACK_SHORT);
   CHECK(ST->overlay == APP_OV_NONE);
 
-  /* Meeting recording keeps the status-page switch. Short todo-key remains
-     MARK; its long press cannot leave the single V2.2 live-timeline page. */
+  /* Meeting recording keeps the status-page switch.  Short todo-key remains
+     MARK.  Server V0.21.0 removed rolling minutes, so its recording-only long
+     press is intentionally inert and must not redraw or leave captions. */
   CHECK(ST->scene == APP_SCENE_MEETING);
   EV(APP_EV_KEY_REC_SHORT);
   CHECK(ST->mode == APP_MODE_RECORDING && ST->page == 0);
   CHECK(app_hold_ms('M') == 1500);
   EV(APP_EV_KEY_BACK_SHORT);
   CHECK(ST->page == 1 && last_render == APP_RENDER_FAST);
+  int renders_before_inert_hold = renders;
   EV(APP_EV_KEY_MARK_HOLD);
   EV(APP_EV_KEY_MARK_RELEASE);
-  CHECK(ST->page == 1 && ST->overlay == APP_OV_NONE);
+  CHECK(ST->page == 1 && ST->overlay == APP_OV_NONE &&
+        renders == renders_before_inert_hold);
   EV(APP_EV_KEY_BACK_SHORT);
   CHECK(ST->page == 0 && last_render == APP_RENDER_FAST);
   EV(APP_EV_KEY_REC_SHORT);
@@ -338,7 +364,6 @@ int main(void) {
 
   /* A result arriving during safe close cannot cover the close/ending page. */
   EV(APP_EV_KEY_REC_SHORT);
-  CHECK(ST->mode == APP_MODE_RECORDING);
   EV(APP_EV_KEY_REC_LONG);
   CHECK(ST->mode == APP_MODE_CLOSING);
   app_state_handle(APP_EV_TODO_RESULT, 1);
@@ -386,18 +411,6 @@ int main(void) {
   CHECK(app_hold_ms('R') == 1500);
   CHECK(app_hold_ms('M') == 600);
   CHECK(app_hold_ms('B') == 3000);
-
-  /* A schema mismatch is destructive and therefore accepts only a long REC
-     confirmation. The production hook reboots after a successful format. */
-  app_state_handle(APP_EV_STORAGE_ERROR, APP_ERR_STORAGE_FORMAT_REQUIRED);
-  CHECK(ST->mode == APP_MODE_STORAGE_ERROR &&
-        ST->error == APP_ERR_STORAGE_FORMAT_REQUIRED);
-  EV(APP_EV_KEY_REC_SHORT);
-  EV(APP_EV_KEY_BACK_SHORT);
-  CHECK(ST->mode == APP_MODE_STORAGE_ERROR && storage_format_requests == 0);
-  EV(APP_EV_KEY_REC_LONG);
-  CHECK(ST->error == APP_ERR_STORAGE_FORMATTING && storage_format_requests == 1);
-
   printf(failures ? "%d state checks failed\n"
                   : "state checks passed (%d renders)\n",
          failures ? failures : renders);

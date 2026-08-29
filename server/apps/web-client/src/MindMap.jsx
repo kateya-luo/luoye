@@ -72,7 +72,7 @@ export default function MindMap({value, onSelect, selectedKey}) {
     return (
       <div className="empty">
         <div className="e-ic"><IconLayout /></div>
-        <div>识别到更多完整语句后，思维导图会在这里自动生成</div>
+        <div>选择模板并生成会议纪要后，这里会展示结构化内容</div>
       </div>
     );
   }

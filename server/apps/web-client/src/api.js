@@ -7,11 +7,28 @@ export const getStoredToken = () => localStorage.getItem(TOKEN_KEY) || '';
 export const storeToken = (token) => localStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
 
+const RETRYABLE_GET_STATUSES = new Set([502, 503, 504]);
+const GET_RETRY_DELAYS_MS = [250, 750];
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
 async function request(path, {token = getStoredToken(), ...options} = {}) {
   const headers = new Headers(options.headers || {});
   if (token) headers.set('Authorization', `Bearer ${token}`);
   if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${API_ORIGIN}${path}`, {...options, headers});
+  const method = String(options.method || 'GET').toUpperCase();
+  const retryDelays = method === 'GET' ? GET_RETRY_DELAYS_MS : [];
+  let response;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      response = await fetch(`${API_ORIGIN}${path}`, {...options, headers});
+    } catch (error) {
+      if (attempt >= retryDelays.length) throw error;
+      await wait(retryDelays[attempt]);
+      continue;
+    }
+    if (!RETRYABLE_GET_STATUSES.has(response.status) || attempt >= retryDelays.length) break;
+    await wait(retryDelays[attempt]);
+  }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     let code = '';
@@ -176,6 +193,10 @@ export async function getMeeting(sessionId) {
   return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}`)).json();
 }
 
+export async function getMeetingProcessing(sessionId, token = getStoredToken()) {
+  return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/processing`, {token})).json();
+}
+
 export async function deleteMeeting(sessionId) {
   return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}`, {method: 'DELETE'})).json();
 }
@@ -184,6 +205,40 @@ export async function updateMeetingTitle(sessionId, title) {
   return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/title`, {
     method: 'PATCH',
     body: JSON.stringify({title}),
+  })).json();
+}
+
+export async function listMinutesTemplates() {
+  return (await request(`${API_V1}/minutes/templates`)).json();
+}
+
+export async function createMinutesJob(sessionId, templateId, templateVersion = 1) {
+  return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/minutes/jobs`, {
+    method: 'POST', body: JSON.stringify({template_id: templateId, template_version: templateVersion, output_language: 'zh'}),
+  })).json();
+}
+
+export async function getMinutesJob(jobId) {
+  return (await request(`${API_V1}/minutes/jobs/${encodeURIComponent(jobId)}`)).json();
+}
+
+export async function listMeetingSpeakers(sessionId) {
+  return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/speakers`)).json();
+}
+
+export async function updateMeetingSpeaker(sessionId, speakerId, payload) {
+  return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/speakers/${encodeURIComponent(speakerId)}`, {
+    method: 'PATCH', body: JSON.stringify(payload),
+  })).json();
+}
+
+export async function listPeopleMemory() {
+  return (await request(`${API_V1}/memory/people`)).json();
+}
+
+export async function confirmMeetingMemory(sessionId, candidates) {
+  return (await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/memory/confirm`, {
+    method: 'POST', body: JSON.stringify({candidates}),
   })).json();
 }
 
@@ -205,7 +260,12 @@ export async function getMeetingAudio(sessionId) {
 export async function exportMeeting(sessionId, format) {
   const response = await request(`${API_V1}/meetings/${encodeURIComponent(sessionId)}/export?format=${format}`);
   const blob = await response.blob();
-  const filename = `meeting-${sessionId}.${format === 'markdown' ? 'md' : format}`;
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const quotedName = disposition.match(/filename="([^"]+)"/i)?.[1];
+  let filename = `会议纪要.${format === 'markdown' ? 'md' : format}`;
+  try { filename = encodedName ? decodeURIComponent(encodedName) : (quotedName || filename); }
+  catch { filename = quotedName || filename; }
   if (window.ClearMeetingAndroid?.saveFile) {
     const base64 = await new Promise((resolve, reject) => {
       const reader = new FileReader();

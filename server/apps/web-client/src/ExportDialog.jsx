@@ -1,5 +1,6 @@
 import React, {useMemo, useState} from 'react';
 import {composeExport} from './exportComposer';
+import {loadExportPreferences, saveExportPreferences} from './exportPreferences';
 import {sectionSizes, formatBytes} from './meetingMeta';
 import {loadLoginPrefs} from './LoginScreen';
 import {IconClose, IconCaptions, IconMinutes, IconMindmap, IconExport, IconFile} from './icons';
@@ -13,10 +14,11 @@ const FORMAT_CARDS = [
 
 export default function ExportDialog({meeting, onClose, onExported}) {
   const sizes = useMemo(() => sectionSizes(meeting), [meeting]);
-  const [format, setFormat] = useState('word');
-  const [sections, setSections] = useState({captions: true, minutes: true, mindmap: true});
-  const [includeInfo, setIncludeInfo] = useState(true);
-  const [watermark, setWatermark] = useState(true);
+  const initialPreferences = useMemo(() => loadExportPreferences(meeting.session_id), [meeting.session_id]);
+  const [format, setFormat] = useState(initialPreferences.format);
+  const [sections, setSections] = useState(initialPreferences.sections);
+  const [includeInfo, setIncludeInfo] = useState(initialPreferences.includeInfo);
+  const [watermark, setWatermark] = useState(initialPreferences.watermark);
   const allChecked = sections.captions && sections.minutes && sections.mindmap;
 
   const estimate = (sections.captions ? sizes.captions : 0) + (sections.minutes ? sizes.minutes : 0)
@@ -24,6 +26,7 @@ export default function ExportDialog({meeting, onClose, onExported}) {
 
   const toggleAll = (v) => setSections({captions: v, minutes: v, mindmap: v});
   const doExport = () => {
+    saveExportPreferences(meeting.session_id, {format, sections, includeInfo, watermark});
     composeExport(meeting, format, {sections, includeInfo, watermark, account: loadLoginPrefs().account});
     onExported?.();
     onClose();
@@ -54,7 +57,7 @@ export default function ExportDialog({meeting, onClose, onExported}) {
             <label className="export-item"><input type="checkbox" checked={sections.captions} onChange={(e) => setSections((s) => ({...s, captions: e.target.checked}))} />
               <span className="ei-ic"><IconCaptions /></span><div className="ei-main"><b>字幕记录</b><span>包含会议全过程的实时字幕</span></div><span className="ei-size">{formatBytes(sizes.captions)}</span></label>
             <label className="export-item"><input type="checkbox" checked={sections.minutes} onChange={(e) => setSections((s) => ({...s, minutes: e.target.checked}))} />
-              <span className="ei-ic"><IconMinutes /></span><div className="ei-main"><b>滚动纪要</b><span>摘要、关键结论、待办、滚动纪要时间线</span></div><span className="ei-size">{formatBytes(sizes.minutes)}</span></label>
+              <span className="ei-ic"><IconMinutes /></span><div className="ei-main"><b>会议纪要</b><span>用户选定模板后生成的摘要、结论与待办</span></div><span className="ei-size">{formatBytes(sizes.minutes)}</span></label>
           </div>
 
           <div className="export-step"><span className="step-n">3</span> 其他选项</div>

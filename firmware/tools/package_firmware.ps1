@@ -1,16 +1,16 @@
 [CmdletBinding()]
 param(
-    [string]$BuildDir = 'build-v232',
-    [string]$ReleaseId = 'luoye-fw-v2.3.2-engineering-live-io-r1',
-    [string]$ExpectedVersion = '2.3.2',
+    [string]$BuildDir = 'build-v170',
+    [string]$ReleaseId = 'luoye-fw-v1.7.0-engineering-sdspi-exact-dma-r2',
+    [string]$ExpectedVersion = '1.7.0',
     [ValidateSet('dev', 'rc', 'release', 'engineering')]
     [string]$Profile = 'engineering',
     [string]$HardwareRev = 'LY-HW-ENG-20260710',
     [string]$ApiContract = 'luoye-device-api/2',
-    [string]$ServerRelease = '1.0.1',
-    [string]$MinimumClientVersion = '1.0.0',
+    [string]$ServerRelease = '0.21.0',
+    [string]$MinimumClientVersion = '0.21.0',
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'http://clearmeeting.chat:34567',
+    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
     [switch]$AllowInsecureHttp,
     [string]$OutputDir = 'releases',
     [switch]$AllowDirty
@@ -20,6 +20,11 @@ $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $build = [IO.Path]::GetFullPath((Join-Path $project $BuildDir))
 $output = [IO.Path]::GetFullPath((Join-Path $project $OutputDir))
+$releasePattern = '^luoye-fw-v' + [regex]::Escape($ExpectedVersion) + '-' +
+                  [regex]::Escape($Profile) + '-[a-z0-9]+(?:-[a-z0-9]+)*$'
+if ($ReleaseId -notmatch $releasePattern) {
+    throw "ReleaseId '$ReleaseId' does not identify firmware v$ExpectedVersion / $Profile"
+}
 
 function Get-Sha256([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -109,6 +114,7 @@ if ($description.target -ne 'esp32s3') {
 }
 
 $compiledCommit = Read-GeneratedString $generatedHeader 'LUOYE_CFG_GIT_COMMIT'
+$compiledDirty = Read-GeneratedInt $generatedHeader 'LUOYE_CFG_GIT_DIRTY'
 $compiledProductNameZh = Read-GeneratedString $generatedHeader 'LUOYE_CFG_PRODUCT_NAME_ZH'
 $compiledHardware = Read-GeneratedString $generatedHeader 'LUOYE_CFG_HARDWARE_REV'
 $compiledFlavor = Read-GeneratedString $generatedHeader 'LUOYE_CFG_BUILD_FLAVOR'
@@ -119,6 +125,9 @@ $compiledServerBaseUrl = Read-GeneratedString $generatedNetHeader 'LUOYE_CFG_SER
 $compiledAllowHttp = Read-GeneratedInt $generatedNetHeader 'LUOYE_CFG_ALLOW_INSECURE_HTTP'
 if (-not $commit.StartsWith($compiledCommit)) {
     throw "Build commit '$compiledCommit' does not match HEAD '$commit'"
+}
+if ($compiledDirty -ne 0) {
+    throw 'The binary was compiled from a dirty or untracked source tree. Rebuild after committing the exact source.'
 }
 if ($compiledHardware -ne $HardwareRev) {
     throw "Build hardware '$compiledHardware' != manifest hardware '$HardwareRev'"
@@ -144,6 +153,42 @@ if ($compiledAllowHttp -ne $expectedAllowHttp) {
 }
 if ($compiledAllowHttp -ne 0 -and $Profile -ne 'dev' -and $Profile -ne 'engineering') {
     throw 'Only dev/engineering packages may contain insecure HTTP support.'
+}
+
+# Do not trust a stale build directory that happened to carry matching version
+# strings. Both patched drivers must resolve to this committed project tree.
+$expectedLocalComponents = @(
+    [IO.Path]::GetFullPath((Join-Path $project 'components\esp_driver_spi')),
+    [IO.Path]::GetFullPath((Join-Path $project 'components\esp_driver_sdspi'))
+)
+$actualComponentPaths = @($description.build_component_paths |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    ForEach-Object {
+        [IO.Path]::GetFullPath(([string]$_).Replace('/', '\')).TrimEnd('\')
+    })
+foreach ($expectedComponent in $expectedLocalComponents) {
+    $matches = @($actualComponentPaths | Where-Object {
+        $_.Equals($expectedComponent.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($matches.Count -ne 1) {
+        throw "Build does not contain exactly one project-local component: $expectedComponent"
+    }
+}
+
+$criticalSources = [ordered]@{
+    esp_driver_spi_master = (Join-Path $project 'components\esp_driver_spi\src\gpspi\spi_master.c')
+    esp_driver_sdspi_host = (Join-Path $project 'components\esp_driver_sdspi\src\sdspi_host.c')
+    esp_driver_sdspi_transaction = (Join-Path $project 'components\esp_driver_sdspi\src\sdspi_transaction.c')
+    storage_runtime = (Join-Path $project 'components\storage_sd\storage_sd.c')
+    upload_store = (Join-Path $project 'components\storage_sd\upload_store.c')
+}
+$criticalSourceHashes = [ordered]@{}
+foreach ($sourceName in $criticalSources.Keys) {
+    $sourcePath = $criticalSources[$sourceName]
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Critical source missing: $sourcePath"
+    }
+    $criticalSourceHashes[$sourceName] = Get-Sha256 $sourcePath
 }
 
 $flasher = Get-Content -LiteralPath $flasherPath -Raw -Encoding utf8 | ConvertFrom-Json
@@ -204,10 +249,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $build 'flash_args') -Destination (Join-Path $flashStage 'flash_args')
     Copy-Item -LiteralPath $flasherPath -Destination (Join-Path $flashStage 'flasher_args.json')
 
-    # Packaging is often started from a normal PowerShell after the build has
-    # already completed. In that case IDF_PATH is not exported, so use the
-    # exact ESP-IDF tree recorded by CMake instead of failing on a null path.
-    $idfRoot = if ($env:IDF_PATH) { $env:IDF_PATH } else { [string]$description.idf_path }
+    # Use the exact framework tree recorded by CMake. An unrelated IDF_PATH in
+    # the packaging shell must never rewrite the build provenance.
+    $idfRoot = [IO.Path]::GetFullPath(([string]$description.idf_path).Replace('/', '\'))
     $idfVersionFile = Join-Path $idfRoot 'tools\cmake\version.cmake'
     if (-not (Test-Path -LiteralPath $idfVersionFile -PathType Leaf)) {
         throw "ESP-IDF version metadata not found: $idfVersionFile"
@@ -219,6 +263,12 @@ try {
         $match.Groups[1].Value
     }
     $idfVersion = "ESP-IDF v$($idfParts -join '.')"
+    $idfCommit = (& git -C $idfRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Cannot resolve ESP-IDF commit: $idfRoot" }
+    $idfDirtyRows = @(& git -C $idfRoot status --porcelain)
+    $idfDirty = $idfDirtyRows.Count -gt 0
+    $idfDescribe = (& git -C $idfRoot describe --always --tags $(if ($idfDirty) { '--dirty' })).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Cannot describe ESP-IDF source: $idfRoot" }
     $manifestFlashRows = @($flashRows | ForEach-Object {
         [ordered]@{
             offset = $_.offset
@@ -244,6 +294,7 @@ try {
         source = [ordered]@{
             git_commit = $commit
             git_dirty = $dirty
+            critical_source_sha256 = $criticalSourceHashes
         }
         compatibility = [ordered]@{
             api_contract = $ApiContract
@@ -255,7 +306,16 @@ try {
         toolchain = [ordered]@{
             target = $description.target
             idf = $idfVersion
+            idf_git_commit = $idfCommit
+            idf_git_describe = $idfDescribe
+            idf_git_dirty = $idfDirty
             compiler = $description.c_compiler
+        }
+        runtime_contract = [ordered]@{
+            range_block_bytes = 10485760
+            sd_spi_frequency_hz = 20000000
+            upload_mode = 'single_task_serial'
+            sdspi_dma = 'static_internal_exact_wire'
         }
         flash = [ordered]@{
             mode = $flasher.flash_settings.flash_mode
@@ -286,11 +346,6 @@ Release: $ReleaseId
 
 This package does not erase flash and does not overwrite NVS.
 
-V2.3.2 storage initialization is intentionally destructive to the SD card.
-After the first boot, when the screen shows "需要初始化存储", hold the REC
-button for about 1.5 seconds. Keep power connected until the device reboots.
-Normal I/O errors never trigger automatic formatting.
-
 ~~~powershell
 python -m esptool --chip esp32s3 --port COMx --baud 460800 --before default_reset --after hard_reset write_flash --flash_mode $($flasher.flash_settings.flash_mode) --flash_freq $($flasher.flash_settings.flash_freq) --flash_size $($flasher.flash_settings.flash_size) 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0x10000 recorder_card.bin 0x610000 assets.bin
 ~~~
@@ -312,8 +367,6 @@ if errorlevel 1 (
 )
 echo.
 echo Flash complete. The board will reset automatically.
-echo If the screen requests storage initialization, hold REC for 1.5 seconds.
-echo Keep power connected until the board formats the SD card and reboots.
 pause
 "@
     $flashBatch | Set-Content -LiteralPath (Join-Path $flashStage 'FLASH_COM22.bat') -Encoding ascii
@@ -357,6 +410,9 @@ pause
         "release_id=$ReleaseId",
         "git_commit=$commit",
         "git_dirty=$dirty",
+        "idf_git_commit=$idfCommit",
+        "idf_git_describe=$idfDescribe",
+        "idf_git_dirty=$idfDirty",
         "branch=$((& git -C $project branch --show-current).Trim())"
     )
     Write-Checksums $symbolsStage

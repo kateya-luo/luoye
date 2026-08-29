@@ -42,8 +42,81 @@ class ParallelOffline:
         return [Segment(start_ms=base_offset_ms, end_ms=base_offset_ms + 1000,
                         text=f"slice-{base_offset_ms}")]
 
+    async def finalize(self, session_id, canonical_sha256=None):
+        self.calls.append(("canonical", session_id, canonical_sha256))
+        return {"segments": [{"text": "canonical"}], "speaker_count": 2}
+
 
 class OfflineJobOrderingTest(unittest.TestCase):
+    def test_cancelled_running_job_is_not_resurrected_by_late_failure(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as d:
+                storage = Storage(Path(d))
+
+                async def on_applied(*_args):
+                    pass
+
+                queue = OfflineJobQueue(
+                    storage.root / "audio_cache", lambda _sid: Timeline(), on_applied,
+                    offline=AlwaysFailOffline(), db=storage.db, worker_count=1)
+                await queue.enqueue("cancel-me", 0, 1000, "bulk")
+                job = await queue._claim("test-worker")
+                self.assertIsNotNone(job)
+                storage.db.execute(
+                    "UPDATE offline_asr_jobs SET state='cancelled' WHERE id=?", (job.job_id,))
+                await queue._persistent_failure(job, RuntimeError("late dependency failure"))
+                row = storage.db.query_one(
+                    "SELECT state,attempts FROM offline_asr_jobs WHERE id=?", (job.job_id,))
+                self.assertEqual(row["state"], "cancelled")
+                self.assertEqual(row["attempts"], 0)
+                storage.db.close()
+
+        asyncio.run(scenario())
+
+    def test_canonical_waits_for_every_slice_and_summary_waits_for_canonical(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as d:
+                storage = Storage(Path(d))
+                audio_root = storage.root / "audio_cache"
+                audio_root.mkdir(parents=True, exist_ok=True)
+                (audio_root / "ordered.b.pcm.part").write_bytes(b"\0" * 96000)
+                timeline = Timeline()
+                recognizer = ParallelOffline()
+                events = []
+                finished = asyncio.Event()
+
+                async def on_applied(_sid, _timeline, patch, _reason):
+                    events.append(("slice", patch.added[0].start_ms))
+
+                async def on_canonical(_sid, payload):
+                    self.assertEqual(payload["speaker_count"], 2)
+                    events.append(("canonical", None))
+
+                async def on_summarize(_sid):
+                    events.append(("summary", None))
+                    finished.set()
+
+                queue = OfflineJobQueue(
+                    audio_root, lambda _sid: timeline, on_applied,
+                    offline=recognizer, on_canonical=on_canonical,
+                    on_summarize=on_summarize, db=storage.db, worker_count=3)
+                for index in range(3):
+                    await queue.enqueue("ordered", index * 1000, (index + 1) * 1000,
+                                        "bulk", order_key="same", chunk_index=index)
+                await queue.enqueue("ordered", 0, 0, "canonical",
+                                    order_key="same", chunk_index=998)
+                await queue.enqueue("ordered", 0, 0, "summarize",
+                                    order_key="same", chunk_index=999)
+                queue.start()
+                await asyncio.wait_for(finished.wait(), timeout=2)
+                await queue.stop()
+
+                self.assertEqual(events[-2:], [("canonical", None), ("summary", None)])
+                self.assertEqual(sum(1 for item in events if item[0] == "slice"), 3)
+                storage.db.close()
+
+        asyncio.run(scenario())
+
     def test_persistent_workers_resume_parallel_jobs_and_hold_summary_barrier(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as d:

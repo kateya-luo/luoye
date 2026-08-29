@@ -1,0 +1,6 @@
+FROM registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+COPY server/offline_canonical_finalizer.py /opt/clearmeeting/offline_canonical_finalizer.py
+COPY server/offline_canonical_service.py /opt/clearmeeting/offline_canonical_service.py
+ENV MODELSCOPE_CACHE=/workspace/models OFFLINE_CANONICAL_PORT=10096
+EXPOSE 10096
+CMD ["python", "/opt/clearmeeting/offline_canonical_service.py"]

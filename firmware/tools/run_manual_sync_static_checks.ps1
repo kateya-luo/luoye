@@ -31,9 +31,23 @@ foreach ($required in @('screen_sync', 'APP_OV_SYNC_CONFIRM',
 foreach ($required in @('s_manual_sync', 's_live_session_id',
                          'sd_upload_current', 'sd_upload_find', 'sd_upload_next',
                          'APP_EV_SYNC_CHANGE', 'phase=local_delete',
-                         'status=deferred reason=session_open')) {
+                         'status=deferred reason=session_open',
+                         's_manual_sync_request_revision',
+                         'state=rearmed revision=',
+                         'next=upload_plan',
+                         'request_upload_plan(item, &plan)',
+                         'history_scan == ESP_ERR_NOT_FOUND',
+                         'state=failed reason=local_scan',
+                         'local_ack=unchanged')) {
     if ($net -notmatch [regex]::Escape($required)) {
         throw "Manual FIFO uploader is missing: $required"
+    }
+}
+foreach ($forbidden in @('persist_manual_sync',
+                          'nvs_set_u8(nvs, "manual_sync"',
+                          'nvs_set_u32(nvs, "manual_gen"')) {
+    if ($net -match [regex]::Escape($forbidden)) {
+        throw "Minimal manual resume must not persist control state in NVS: $forbidden"
     }
 }
 foreach ($required in @('sd_storage_delete_local', 'sd_storage_delete_all_local',

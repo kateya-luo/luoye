@@ -136,18 +136,18 @@ static esp_err_t write_json_atomic(const char *path, cJSON *root) {
 static cJSON *read_json_one(const char *path) {
   FILE *file = fopen(path, "rb");
   if (!file) return NULL;
-  size_t length = 0;
-  if (storage_sd_size(file, &length) != ESP_OK || length > JSON_LIMIT ||
-      storage_sd_seek(file, 0) != ESP_OK) {
+  if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return NULL; }
+  long length = ftell(file);
+  if (length < 0 || length > (long)JSON_LIMIT || fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
     return NULL;
   }
-  char *data = malloc(length + 1U);
+  char *data = malloc((size_t)length + 1U);
   if (!data) { fclose(file); return NULL; }
   size_t got = 0;
-  esp_err_t read_result = storage_sd_read(file, data, length, &got);
+  esp_err_t read_result = storage_sd_read(file, data, (size_t)length, &got);
   fclose(file);
-  if (read_result != ESP_OK || got != length) {
+  if (read_result != ESP_OK || got != (size_t)length) {
     free(data);
     return NULL;
   }
@@ -702,17 +702,17 @@ esp_err_t todo_read_audio(const luoye_todo_item_t *item,
   snprintf(path, sizeof(path), "%s/audio.wav", item->directory);
   FILE *file = fopen(path, "rb");
   if (!file) return ESP_ERR_NOT_FOUND;
-  size_t length = 0;
-  if (storage_sd_size(file, &length) != ESP_OK ||
-      length < LUOYE_WAV_HEADER_BYTES || length > capacity ||
-      storage_sd_seek(file, 0) != ESP_OK) {
+  if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return ESP_FAIL; }
+  long length = ftell(file);
+  if (length < (long)LUOYE_WAV_HEADER_BYTES || (size_t)length > capacity ||
+      fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
     return ESP_ERR_INVALID_SIZE;
   }
   size_t got = 0;
-  esp_err_t read_result = storage_sd_read(file, buffer, length, &got);
+  esp_err_t read_result = storage_sd_read(file, buffer, (size_t)length, &got);
   fclose(file);
-  if (read_result != ESP_OK || got != length) return ESP_FAIL;
+  if (read_result != ESP_OK || got != (size_t)length) return ESP_FAIL;
   *size_out = got;
   return ESP_OK;
 }

@@ -17,23 +17,13 @@
 #include "freertos/task.h"
 
 #define DEFAULT_UI_TIMEZONE_OFFSET_MINUTES 480
-#define RECORD_HEADER_INTERVAL_SECONDS 5
-#define RECORD_FAST_INTERVAL_SECONDS 60
-#define UI_TASK_STACK_BYTES 32768
-#define LIVE_TICKER_X 7
-#define LIVE_TICKER_Y 51
-#define LIVE_TICKER_WIDTH 186
-#define LIVE_TICKER_HEIGHT 27
-/* The SSD1681 is unreliable when an auto-diff minute update collapses to a
-   very small glyph-only rectangle after panel sleep.  Refresh one stable
-   logical window containing both home-page fields instead: battery
+/* SSD1681 can miss a tiny glyph-only auto-diff after panel sleep.  Keep one
+   stable, proven-size window for both dynamic home fields instead: battery
    (158,4,40,17) and clock (27,27,147,52). */
 #define HOME_CLOCK_BATTERY_X 24
 #define HOME_CLOCK_BATTERY_Y 2
 #define HOME_CLOCK_BATTERY_WIDTH 174
 #define HOME_CLOCK_BATTERY_HEIGHT 78
-#define UNIFIED_CAPTION_BYTES \
-  (LUOYE_LIVE_MEETING_BYTES + LUOYE_LIVE_PARTIAL_BYTES + 2)
 
 static const char *TAG = "ui154";
 static uint8_t s_fb[EPD_FB_BYTES];              // packed 1bpp: 0=white, 1=black
@@ -44,12 +34,6 @@ static volatile bool s_busy;
 static bool s_assets_ready;
 static bool s_have_panel_screen;
 static uint32_t s_panel_screen;
-static char s_unified_caption[UNIFIED_CAPTION_BYTES];
-static const ui154_layout_field_t s_live_ticker_field = {
-  "05_meeting_caption", "live_ticker", "",
-  LIVE_TICKER_X, LIVE_TICKER_Y, LIVE_TICKER_WIDTH, LIVE_TICKER_HEIGHT,
-  24, 22, 1, UI154_ALIGN_LEFT, 500
-};
 
 /* Stable identity of the visual page, intentionally excluding values that can
    change inside the same page (clock, battery, network and upload status).
@@ -97,60 +81,6 @@ static int64_t ui_clock_seconds(void) {
   return now >= 1577836800 ? (int64_t)now : monotonic_ms / 1000;
 }
 
-static bool utf8_boundary(const char *text, size_t length, size_t offset) {
-  return offset == 0 || offset == length ||
-         (((unsigned char)text[offset] & 0xc0U) != 0x80U);
-}
-
-/* Server state keeps committed captions and the current online hypothesis in
-   separate fields. The e-paper UI deliberately exposes one continuous stream.
-   Exact suffix/prefix overlap removal also makes a partial->final handoff
-   pixel-stable when the server briefly reports the same text in both fields. */
-static size_t caption_overlap_bytes(const char *committed,
-                                    const char *partial) {
-  size_t committed_length = strlen(committed ? committed : "");
-  size_t partial_length = strlen(partial ? partial : "");
-  size_t maximum = committed_length < partial_length
-                     ? committed_length : partial_length;
-  size_t minimum = partial_length < 6U ? partial_length : 6U;
-  for (size_t count = maximum; count >= minimum && count > 0; --count) {
-    size_t committed_start = committed_length - count;
-    if (!utf8_boundary(committed, committed_length, committed_start) ||
-        !utf8_boundary(partial, partial_length, count)) continue;
-    if (memcmp(committed + committed_start, partial, count) == 0) return count;
-  }
-  return 0;
-}
-
-static const char *unified_caption_text(const luoye_live_result_t *live) {
-  s_unified_caption[0] = '\0';
-  if (!live || live->kind != LUOYE_LIVE_MEETING) return s_unified_caption;
-  strlcpy(s_unified_caption, live->meeting_text,
-          sizeof(s_unified_caption));
-  const char *partial = live->partial_supported && live->partial_active
-                          ? live->partial_text : "";
-  if (!partial[0]) return s_unified_caption;
-  size_t overlap = caption_overlap_bytes(s_unified_caption, partial);
-  if (overlap == 0 && s_unified_caption[0]) {
-    size_t length = strlen(s_unified_caption);
-    if (s_unified_caption[length - 1] != ' ') {
-      strlcat(s_unified_caption, " ", sizeof(s_unified_caption));
-    }
-  }
-  strlcat(s_unified_caption, partial + overlap,
-          sizeof(s_unified_caption));
-  return s_unified_caption;
-}
-
-static uint32_t hash_text(uint32_t hash, const char *text) {
-  for (const unsigned char *p = (const unsigned char *)(text ? text : "");
-       *p; ++p) {
-    hash ^= *p;
-    hash *= 16777619U;
-  }
-  return hash;
-}
-
 // 5x7 ASCII for compact status fields and a usable fallback when font16.bin is absent.
 static const uint8_t FONT[59][5] = {
   {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
@@ -193,24 +123,6 @@ static void white_rect(int x, int y, int w, int h) {
       if (px < 0 || px >= EPD_LANDSCAPE_W) continue;
       size_t index = py * EPD_FB_STRIDE + (px >> 3);
       s_fb[index] &= (uint8_t)~(0x80U >> (px & 7));
-    }
-  }
-}
-
-/* 16x16 pure-black leaf emphasis mark, derived from the product leaf glyph.
-   Keeping it as a 1-bit row mask avoids grayscale and runtime scaling. */
-static void draw_timeline_leaf(int x, int y) {
-  static const uint16_t rows[16] = {
-    0x0000, 0x0002, 0x003E, 0x03FE,
-    0x0FFE, 0x1FFC, 0x3FFC, 0x3FFC,
-    0x3BFC, 0x37F8, 0x2FF0, 0x1FE0,
-    0x7FC0, 0x6000, 0x0000, 0x0000,
-  };
-  for (int row = 0; row < 16; row++) {
-    for (int col = 0; col < 16; col++) {
-      if ((rows[row] & (uint16_t)(1U << (15 - col))) != 0) {
-        ui_fb_rect(x + col, y + row, 1, 1);
-      }
     }
   }
 }
@@ -399,19 +311,9 @@ static void layout_draw_field(const char *page_id, const char *field_id,
   layout_draw(ui154_layout_find(page_id, field_id), text, true, false);
 }
 
-/* Hash exactly the suffix that can appear in the one-line ticker. Changes to
-   older transcript text (for example speaker-label backfills) therefore cannot
-   trigger a visually identical e-paper refresh. */
-static const char *live_ticker_text(const luoye_live_result_t *live) {
-  const char *text = unified_caption_text(live);
-  while (*text && !layout_text_fits(&s_live_ticker_field, text)) {
-    text = next_utf8(text);
-  }
-  return text;
-}
-
-static uint32_t live_ticker_hash(const luoye_live_result_t *live) {
-  return hash_text(2166136261U, live_ticker_text(live));
+static void layout_draw_field_latest(const char *page_id, const char *field_id,
+                                     const char *text) {
+  layout_draw(ui154_layout_find(page_id, field_id), text, true, true);
 }
 
 static bool load_layout_page(const char *page_id) {
@@ -604,78 +506,25 @@ static void screen_standby(const app_state_t *state) {
   }
 }
 
-static void screen_live_timeline(const app_state_t *state,
-                                 const luoye_live_result_t *live) {
-  /* V2.2 is one stable recording canvas: the large title row becomes a live
-     one-line ticker while the two server-generated timeline points stay below.
-     Final/partial is deliberately invisible to the user. */
+static void screen_caption(const app_state_t *state) {
+  luoye_live_result_t live = {0};
   const char *page = "05_meeting_caption";
-  load_page(page);
+  load_layout_page(page);
   draw_layout_battery(page, "battery_1785832324207", state->battery);
-
   char elapsed[8];
   fmt_mmss(elapsed, sizeof(elapsed), app_state_elapsed_ms());
   char header[20];
   snprintf(header, sizeof(header), "录音 %s", elapsed);
   layout_draw_field(page, "header", header);
-
-  white_rect(7, 25, 186, 150);
-  static const ui154_layout_field_t label = {
-    "05_meeting_caption", "timeline_label", "", 7, 25, 82, 18,
-    16, 18, 1, UI154_ALIGN_LEFT, 400
-  };
-  static const ui154_layout_field_t range_field = {
-    "05_meeting_caption", "timeline_range", "", 100, 25, 95, 16,
-    14, 14, 1, UI154_ALIGN_RIGHT, 400
-  };
-  static const ui154_layout_field_t point1 = {
-    "05_meeting_caption", "timeline_point1", "", 22, 88, 171, 42,
-    18, 21, 2, UI154_ALIGN_LEFT, 400
-  };
-  static const ui154_layout_field_t point2 = {
-    "05_meeting_caption", "timeline_point2", "", 23, 131, 171, 42,
-    18, 21, 2, UI154_ALIGN_LEFT, 400
-  };
-  static const ui154_layout_field_t chapter = {
-    "05_meeting_caption", "timeline_chapter", "", 7, 180, 54, 18,
-    16, 18, 1, UI154_ALIGN_LEFT, 400
-  };
-  static const ui154_layout_field_t footer = {
-    "05_meeting_caption", "timeline_footer", "", 38, 182, 123, 14,
-    11, 14, 1, UI154_ALIGN_RIGHT, 400
-  };
-
-  layout_draw(&label, "时间戳纪要", false, false);
-  char range[24] = "00:00-现在";
-  if (live && live->kind == LUOYE_LIVE_MEETING && live->timeline_available) {
-    unsigned minutes = (unsigned)(live->chapter_start_ms / 60000U);
-    unsigned seconds = (unsigned)((live->chapter_start_ms / 1000U) % 60U);
-    snprintf(range, sizeof(range), "%02u:%02u-现在", minutes, seconds);
-  }
-  layout_draw(&range_field, range, false, false);
-  bool have_live = live && live->kind == LUOYE_LIVE_MEETING;
-  const char *ticker = have_live ? live_ticker_text(live) : "";
-  layout_draw(&s_live_ticker_field,
-              ticker[0] ? ticker : "等待实时字幕", false, false);
-  ui_fb_rect(7, 80, 186, 1);
-  draw_timeline_leaf(3, 89);
-  layout_draw(&point1,
-              have_live && live->timeline_available && live->chapter_item_1[0]
-                ? live->chapter_item_1 : "等待云端生成时间戳纪要。",
-              false, false);
-  if (have_live && live->timeline_available && live->chapter_item_2[0]) {
-    draw_timeline_leaf(3, 132);
-    layout_draw(&point2, live->chapter_item_2, false, false);
-  }
-  char chapter_text[20];
-  if (have_live && live->timeline_available && live->chapter_no > 0) {
-    snprintf(chapter_text, sizeof(chapter_text), "第%u章",
-             (unsigned)live->chapter_no);
+  bool have_live = net_live_snapshot(&live);
+  const char *caption = NULL;
+  if (have_live && live.kind == LUOYE_LIVE_MEETING && live.meeting_text[0]) {
+    caption = live.meeting_text;
   } else {
-    snprintf(chapter_text, sizeof(chapter_text), "等待章节");
+    caption = "正在聆听，等待云端返回字幕。";
   }
-  layout_draw(&chapter, chapter_text, false, false);
-  layout_draw(&footer, "录音键暂停 · 长按结束", false, false);
+  layout_draw_field_latest(page, "caption", caption);
+  layout_draw_field(page, "footer", "录音键暂停 · 长按结束");
 }
 
 static void screen_record_status(const app_state_t *state) {
@@ -696,8 +545,7 @@ static void screen_record_status(const app_state_t *state) {
   layout_draw_field(page, "storage_value", state->sd_low ? "将满" : "正常");
 }
 
-static void screen_recording(const app_state_t *state,
-                             const luoye_live_result_t *caption_live) {
+static void screen_recording(const app_state_t *state) {
   if (state->locked) {
     const char *page = "08_meeting_locked";
     load_layout_page(page);
@@ -722,7 +570,7 @@ static void screen_recording(const app_state_t *state,
     screen_record_status(state);
     layout_draw_field("06_meeting_status", "footer", "设置键 返回字幕");
   } else {
-    screen_live_timeline(state, caption_live);
+    screen_caption(state);
   }
 }
 
@@ -799,8 +647,7 @@ static void screen_sync(const app_state_t *state) {
   draw_layout_battery(page, "battery_1785832374716", state->battery);
   if (state->overlay == APP_OV_SYNC_CONFIRM) {
     layout_draw_field(page, "title", "同步录音");
-    layout_draw_field(page, "subtitle",
-                      state->backlog_s ? "按待办键开始上传" : "当前没有待传录音");
+    layout_draw_field(page, "subtitle", "按待办键检查并继续");
     layout_draw_field(page, "footer", "设置键 取消");
   } else if (state->overlay == APP_OV_SYNC_PROGRESS) {
     char progress[48];
@@ -888,16 +735,7 @@ static void screen_storage_error(const app_state_t *state) {
   load_layout_page(page);
   draw_layout_battery(page, "battery_1785832389733", state->battery);
   layout_draw_field(page, "footer", "设置键 返回主页");
-  if (state->error == APP_ERR_STORAGE_FORMAT_REQUIRED) {
-    layout_draw_field(page, "title", "需要初始化存储");
-    layout_draw_field(page, "footer", "长按录音键确认格式化");
-  } else if (state->error == APP_ERR_STORAGE_FORMATTING) {
-    layout_draw_field(page, "title", "正在初始化存储");
-    layout_draw_field(page, "footer", "请勿断电或拔出SD卡");
-  } else if (state->error == APP_ERR_STORAGE_FORMAT_FAILED) {
-    layout_draw_field(page, "title", "存储初始化失败");
-    layout_draw_field(page, "footer", "断电重启后重试");
-  } else if (state->error == APP_ERR_MIC) {
+  if (state->error == APP_ERR_MIC) {
     layout_draw_field(page, "title", "麦克风异常");
   } else if (state->error == APP_ERR_SD_FULL) {
     layout_draw_field(page, "title", "存储空间已满");
@@ -905,8 +743,7 @@ static void screen_storage_error(const app_state_t *state) {
   }
 }
 
-static void build_screen(const app_state_t *state,
-                         const luoye_live_result_t *caption_live) {
+static void build_screen(const app_state_t *state) {
   if (state->mode == APP_MODE_OFF) {
     memset(s_fb, 0, sizeof(s_fb));            // physical power-off request leaves a white panel
     return;
@@ -948,7 +785,7 @@ static void build_screen(const app_state_t *state,
       draw_layout_battery("04_meeting_prepare", "battery_1785832320453", state->battery);
       break;
     case APP_MODE_RECORDING:
-      screen_recording(state, caption_live);
+      screen_recording(state);
       break;
     case APP_MODE_CLOSING: {
       const char *page = "09_meeting_saving";
@@ -986,32 +823,10 @@ static void build_screen(const app_state_t *state,
   }
 }
 
-static bool recording_live_active(const app_state_t *state) {
-  return state && state->mode == APP_MODE_RECORDING && !state->paused &&
-         !state->locked && state->overlay == APP_OV_NONE &&
-         (state->page & 1U) == 0;
-}
-
-/* A live refresh makes its decision, pixels and acknowledged hashes from one
-   immutable snapshot. Caption revisions and summary revisions drive separate
-   physical windows on the single V2.2 recording page. */
-static esp_err_t render_once_panel_snapshot(
-    app_render_t kind, const luoye_live_result_t *requested_live,
-    luoye_live_result_t *rendered_live, bool *rendered_have_live) {
+static esp_err_t render_once_panel(app_render_t kind) {
   static bool stack_logged;
   s_busy = true;
   app_state_t snapshot = *app_state_get();
-  luoye_live_result_t caption_snapshot = {0};
-  bool have_caption_snapshot = false;
-  if (recording_live_active(&snapshot)) {
-    if (requested_live && requested_live->kind == LUOYE_LIVE_MEETING) {
-      caption_snapshot = *requested_live;
-      have_caption_snapshot = true;
-    } else {
-      have_caption_snapshot = net_live_snapshot(&caption_snapshot) &&
-                              caption_snapshot.kind == LUOYE_LIVE_MEETING;
-    }
-  }
   uint32_t next_screen = screen_identity(&snapshot);
   app_render_t requested_kind = kind;
   if (s_have_panel_screen && next_screen != s_panel_screen &&
@@ -1022,51 +837,26 @@ static esp_err_t render_once_panel_snapshot(
              (unsigned long)s_panel_screen, (unsigned long)next_screen,
              (int)requested_kind);
   }
-  build_screen(&snapshot,
-               have_caption_snapshot ? &caption_snapshot : NULL);
-
-  /* Coalesce to the newest unified text immediately before touching the panel.
-     Changes arriving after this point are caught as soon as the physical
-     waveform completes. */
-  if (kind == APP_RENDER_RECORD_LIVE_PARTIAL && have_caption_snapshot) {
-    luoye_live_result_t latest = {0};
-    bool have_latest = net_live_snapshot(&latest) &&
-                       latest.kind == LUOYE_LIVE_MEETING;
-    bool session_changed = have_latest &&
-        strcmp(latest.client_session_id,
-               caption_snapshot.client_session_id) != 0;
-    bool text_changed = have_latest &&
-        live_ticker_hash(&latest) !=
-          live_ticker_hash(&caption_snapshot);
-    if (have_latest && (session_changed || text_changed)) {
-      caption_snapshot = latest;
-      have_caption_snapshot = true;
-      build_screen(&snapshot, &caption_snapshot);
-      ESP_LOGI(TAG,
-               "LY|UI_RECORD|event=live_coalesced text_hash=%08lx display_revision=%lu",
-               (unsigned long)live_ticker_hash(&caption_snapshot),
-               (unsigned long)caption_snapshot.display_revision);
-    }
-  }
+  build_screen(&snapshot);
   if (kind == APP_RENDER_FULL) {
     epd_frame_full(s_fb);
   } else if (kind == APP_RENDER_CLOCK_PARTIAL) {
-    /* Always send the same proven-size window after standby wake.  This keeps
-       the clock and battery synchronized and avoids SSD1681 no-op updates
-       caused by a tiny auto-diff glyph rectangle. */
+    /* Rebuild the current clock and battery together, then always send the
+       same panel-safe window.  This avoids unreliable tiny glyph rectangles
+       after light-sleep wake while keeping Wi-Fi and the rest of the panel
+       asleep. */
     epd_frame_partial_window(s_fb, HOME_CLOCK_BATTERY_X,
                              HOME_CLOCK_BATTERY_Y,
                              HOME_CLOCK_BATTERY_WIDTH,
                              HOME_CLOCK_BATTERY_HEIGHT);
-  } else if (kind == APP_RENDER_RECORD_HEADER_PARTIAL) {
-    epd_frame_partial_window(s_fb, 4, 4, 192, 19);
-  } else if (kind == APP_RENDER_RECORD_LIVE_PARTIAL) {
-    epd_frame_partial_window(s_fb, LIVE_TICKER_X, LIVE_TICKER_Y,
-                             LIVE_TICKER_WIDTH, LIVE_TICKER_HEIGHT);
   } else if (kind == APP_RENDER_STATUS_PARTIAL) {
     /* Network, binding, backlog, storage and battery can be far apart. Let the
        panel driver bound the update to the pixels that actually changed. */
     epd_frame_partial_auto(s_fb);
+  } else if (kind == APP_RENDER_PARTIAL) {
+    // Only the dynamic recording header/body is touched. The approved border
+    // and fixed footer remain electrically quiet until the periodic FAST refresh.
+    epd_frame_partial_window(s_fb, 4, 8, 192, 171);
   } else {
     epd_frame_fast(s_fb);
   }
@@ -1083,25 +873,16 @@ static esp_err_t render_once_panel_snapshot(
              (unsigned)sizeof(StackType_t));
   }
   s_busy = false;
-  if (rendered_live) {
-    *rendered_live = caption_snapshot;
-  }
-  if (rendered_have_live) {
-    *rendered_have_live = have_caption_snapshot;
-  }
   return panel_error;
 }
 
-static esp_err_t render_once_panel(app_render_t kind) {
-  return render_once_panel_snapshot(kind, NULL, NULL, NULL);
+static esp_err_t render_once(app_render_t kind) {
+  return render_once_panel(kind);
 }
 
 static void ui_task(void *argument) {
   (void)argument;
   int64_t displayed_five_second = -1;
-  int64_t displayed_fast_slot = -1;
-  uint32_t displayed_caption_hash = 0;
-  char displayed_live_session[LUOYE_LIVE_SESSION_ID_BYTES] = {0};
   int64_t displayed_home_minute = -1;
   for (;;) {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
@@ -1111,10 +892,7 @@ static void ui_task(void *argument) {
     s_pending = -1;
     xSemaphoreGive(s_lock);
     if (kind >= 0) {
-      luoye_live_result_t rendered_live = {0};
-      bool rendered_have_live = false;
-      esp_err_t panel_error = render_once_panel_snapshot(
-          (app_render_t)kind, NULL, &rendered_live, &rendered_have_live);
+      esp_err_t panel_error = render_once((app_render_t)kind);
       const app_state_t *rendered = app_state_get();
       if (rendered->mode == APP_MODE_RECORDING && !rendered->paused &&
           !rendered->locked && rendered->overlay == APP_OV_NONE &&
@@ -1123,31 +901,18 @@ static void ui_task(void *argument) {
         int64_t monotonic_ms = esp_timer_get_time() / 1000;
         int64_t seconds = now >= 1577836800 ? (int64_t)now
                                             : monotonic_ms / 1000;
-        displayed_five_second = seconds / RECORD_HEADER_INTERVAL_SECONDS;
-        displayed_fast_slot = seconds / RECORD_FAST_INTERVAL_SECONDS;
-        if (kind >= APP_RENDER_FAST) {
-          if (rendered_have_live) {
-            displayed_caption_hash = live_ticker_hash(&rendered_live);
-            strlcpy(displayed_live_session, rendered_live.client_session_id,
-                    sizeof(displayed_live_session));
-          } else {
-            displayed_caption_hash = 0;
-            displayed_live_session[0] = '\0';
-          }
-        }
+        displayed_five_second = seconds / 5;
       } else {
         displayed_five_second = -1;
-        displayed_fast_slot = -1;
-        displayed_caption_hash = 0;
-        displayed_live_session[0] = '\0';
       }
       if (!home_clock_active(rendered)) {
         displayed_home_minute = -1;
       } else if (panel_error == ESP_OK) {
         displayed_home_minute = ui_clock_seconds() / 60;
       } else {
-        /* Do not acknowledge a minute that the panel did not accept.  The
-           one-second UI loop will retry while keeping all networking asleep. */
+        /* Do not acknowledge a minute that was not accepted by the panel.
+           The one-second UI loop retries without waking networking. */
+        displayed_home_minute = -1;
         ESP_LOGW(TAG,
                  "LY|UI_CLOCK|event=render_retry reason=%s minute=%lld",
                  esp_err_to_name(panel_error),
@@ -1161,100 +926,22 @@ static void ui_task(void *argument) {
         state->overlay == APP_OV_NONE && (state->page & 1U) == 0) {
       time_t now = time(NULL);
       int64_t seconds = now >= 1577836800 ? (int64_t)now : now_ms / 1000;
-      int64_t five_second = seconds / RECORD_HEADER_INTERVAL_SECONDS;
-      int64_t fast_slot = seconds / RECORD_FAST_INTERVAL_SECONDS;
+      int64_t five_second = seconds / 5;
       if (displayed_five_second < 0) {
         displayed_five_second = five_second;
-        displayed_fast_slot = fast_slot;
-      } else if (displayed_fast_slot >= 0 && fast_slot != displayed_fast_slot) {
-        luoye_live_result_t rendered_live = {0};
-        bool rendered_have_live = false;
-        render_once_panel_snapshot(APP_RENDER_FAST, NULL,
-                                   &rendered_live, &rendered_have_live);
+      } else if (five_second != displayed_five_second) {
+        /* Bound recording-page partial accumulation to five minutes.  FAST
+           repaints the whole panel without the slower black/white FULL cycle. */
+        bool periodic_fast = (five_second % 60) == 0;
+        render_once_panel(periodic_fast ? APP_RENDER_FAST : APP_RENDER_PARTIAL);
         displayed_five_second = five_second;
-        displayed_fast_slot = fast_slot;
-        if (rendered_have_live) {
-          displayed_caption_hash = live_ticker_hash(&rendered_live);
-          strlcpy(displayed_live_session, rendered_live.client_session_id,
-                  sizeof(displayed_live_session));
-        } else {
-          displayed_caption_hash = 0;
-          displayed_live_session[0] = '\0';
-        }
-        displayed_five_second = ui_clock_seconds() /
-                                RECORD_HEADER_INTERVAL_SECONDS;
         ESP_LOGI(TAG,
-                 "LY|UI_RECORD|refresh=fast second=%u view=live-timeline chapter=%u",
-                 (unsigned)(seconds % 60),
-                 rendered_have_live && rendered_live.timeline_available
-                   ? (unsigned)rendered_live.chapter_no : 0U);
-      } else {
-        luoye_live_result_t live = {0};
-        bool have_live = net_live_snapshot(&live) &&
-                         live.kind == LUOYE_LIVE_MEETING;
-        bool new_session = have_live &&
-            strcmp(displayed_live_session, live.client_session_id) != 0;
-        uint32_t text_hash = have_live ? live_ticker_hash(&live) : 0;
-        bool caption_due = new_session ||
-                           text_hash != displayed_caption_hash;
-        if (caption_due) {
-          /* Only the one-line ticker changes between minute FAST refreshes.
-             Summary revisions are intentionally ignored here so the two lower
-             rows remain visually stable for the whole minute. */
-          luoye_live_result_t latest = {0};
-          if (net_live_snapshot(&latest) &&
-              latest.kind == LUOYE_LIVE_MEETING) {
-            live = latest;
-            have_live = true;
-          }
-          luoye_live_result_t rendered_live = {0};
-          bool rendered_have_live = false;
-          render_once_panel_snapshot(APP_RENDER_RECORD_LIVE_PARTIAL,
-                                     have_live ? &live : NULL,
-                                     &rendered_live, &rendered_have_live);
-          if (rendered_have_live) {
-            displayed_caption_hash = live_ticker_hash(&rendered_live);
-            strlcpy(displayed_live_session, rendered_live.client_session_id,
-                    sizeof(displayed_live_session));
-            ESP_LOGI(TAG,
-                     "LY|UI_RECORD|refresh=ticker text_hash=%08lx display_revision=%lu",
-                     (unsigned long)displayed_caption_hash,
-                     (unsigned long)rendered_live.display_revision);
-          } else {
-            displayed_caption_hash = 0;
-            displayed_live_session[0] = '\0';
-          }
-
-          /* The panel waveform cannot be interrupted. If text changed while
-             it was busy, immediately run one more transaction with the latest
-             snapshot; intermediate hypotheses remain intentionally invisible. */
-          luoye_live_result_t after = {0};
-          if (net_live_snapshot(&after) &&
-              after.kind == LUOYE_LIVE_MEETING &&
-              (strcmp(displayed_live_session, after.client_session_id) != 0 ||
-               live_ticker_hash(&after) != displayed_caption_hash)) {
-            xTaskNotifyGive(s_task);
-            ESP_LOGI(TAG,
-                     "LY|UI_RECORD|event=live_catchup text_hash=%08lx",
-                     (unsigned long)live_ticker_hash(&after));
-          }
-        } else if (five_second != displayed_five_second) {
-          /* The elapsed-time header is lower priority than caption text. It is
-             refreshed only when there is no pending caption change, and its
-             narrow window cannot disturb the live ticker or summaries. */
-          render_once_panel(APP_RENDER_RECORD_HEADER_PARTIAL);
-          displayed_five_second = ui_clock_seconds() /
-                                  RECORD_HEADER_INTERVAL_SECONDS;
-          ESP_LOGI(TAG,
-                   "LY|UI_RECORD|refresh=header second=%u view=live-timeline",
-                   (unsigned)(seconds % 60));
-        }
+                 "LY|UI_RECORD|refresh=%s second=%u view=caption",
+                 periodic_fast ? "fast" : "partial",
+                 (unsigned)(seconds % 60));
       }
     } else {
       displayed_five_second = -1;
-      displayed_fast_slot = -1;
-      displayed_caption_hash = 0;
-      displayed_live_session[0] = '\0';
     }
     if (home_clock_active(state)) {
       int64_t seconds = ui_clock_seconds();
@@ -1262,16 +949,21 @@ static void ui_task(void *argument) {
       if (displayed_home_minute < 0 || minute != displayed_home_minute) {
         time_t now = time(NULL);
         struct tm local = {0};
-        bool half_hour = false;
+        bool top_of_hour = false;
+        bool ten_minute = false;
         if (now >= 1577836800) {
           account_localtime(now, &local);
-          half_hour = (local.tm_min % 30) == 0;
+          top_of_hour = local.tm_min == 0;
+          ten_minute = (local.tm_min % 10) == 0;
         }
-        esp_err_t panel_error = render_once_panel(
-            half_hour ? APP_RENDER_FULL : APP_RENDER_CLOCK_PARTIAL);
+        app_render_t clock_render = top_of_hour ? APP_RENDER_FULL :
+                                    ten_minute ? APP_RENDER_FAST :
+                                                 APP_RENDER_CLOCK_PARTIAL;
+        esp_err_t panel_error = render_once_panel(clock_render);
         if (panel_error == ESP_OK) displayed_home_minute = minute;
         ESP_LOGI(TAG, "LY|UI_CLOCK|refresh=%s minute=%lld result=%s",
-                 half_hour ? "full" : "clock+battery-partial",
+                 top_of_hour ? "full" :
+                 ten_minute ? "fast" : "clock+battery-partial",
                  (long long)minute, esp_err_to_name(panel_error));
       }
     } else {
@@ -1291,11 +983,8 @@ esp_err_t ui_init(void) {
   s_assets_ready = probe != NULL;
   if (probe) fclose(probe);
   if (!s_assets_ready) ESP_LOGE(TAG, "approved 1.54-inch UI assets are missing");
-  /* Immutable network snapshots and live-timeline layout are deliberately bounded,
-     while the larger stack retains measured headroom for nested font calls. */
-  if (xTaskCreate(ui_task, "ui", UI_TASK_STACK_BYTES, NULL, 6, &s_task) != pdPASS) {
-    return ESP_ERR_NO_MEM;
-  }
+  /* Timeline text adds a bounded local composition buffer. */
+  if (xTaskCreate(ui_task, "ui", 12288, NULL, 6, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
   ESP_LOGI(TAG, "UI ready: GDEY0154D67 200x200 BW-FAST, assets=%s font=%s (%s) layout=%.12s",
            s_assets_ready ? "OK" : "MISSING", ui_font_ready() ? "16px" : "fallback",
            esp_err_to_name(font_error), ui154_layout_sha256());

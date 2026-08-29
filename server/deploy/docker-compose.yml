@@ -35,23 +35,28 @@ services:
   # 16 GiB / 8 核主机可启用：--profile offline-asr-cpu；不启用时 server 仍可复用 funasr。
   funasr-offline-cpu:
     profiles: ["offline-asr-cpu"]
-    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
-    privileged: true
-    command:
-      - bash
-      - -lc
-      - >-
-        cd /workspace/FunASR/runtime &&
-        bash run_server_2pass.sh --download-model-dir /workspace/models --certfile 0;
-        sleep 20 ;
-        while pgrep -f '[f]unasr-wss-server' >/dev/null; do sleep 10; done
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.offline-canonical
+    environment:
+      - MODELSCOPE_CACHE=/workspace/models
+      - OFFLINE_CANONICAL_PORT=10096
+      - OFFLINE_CANONICAL_AUDIO_ROOT=/app/data/audio_cache
+      - OFFLINE_CANONICAL_SPK_MERGE_THRESHOLD=0.78
     volumes:
       - ${FUNASR_MODELS_DIR:-../../funasr-runtime-resources/models}:/workspace/models
+      - ../server/data:/app/data:ro
     expose:
-      - "10095"
+      - "10096"
     cpus: 2.5
-    mem_limit: 5g
-    memswap_limit: 7g
+    mem_limit: 6g
+    memswap_limit: 8g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10096/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
     restart: unless-stopped
 
   # 【可选】专用 GPU 离线转写服务。当前稳定部署不用它——优先使用上面的 CPU 隔离实例。

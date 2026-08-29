@@ -11,30 +11,23 @@ typedef void (*storage_post_fn)(app_event_t event, int32_t arg);
 
 esp_err_t storage_sd_init(storage_post_fn post);
 bool storage_sd_mounted(void);
+bool storage_sd_faulted(void);
 
-/* Destructive, user-confirmed initialization for the luoye-storage/2 layout.
- * The caller must reboot after ESP_OK so every storage consumer starts from a
- * freshly mounted volume. */
-esp_err_t storage_sd_format(void);
+/* Promote a confirmed filesystem/device I/O failure to the single runtime
+ * FAULTED state.  The first caller logs the transition; later callers become
+ * no-ops so a broken SDSPI command stream cannot create an error storm. */
+void storage_sd_report_io_fault(const char *source, esp_err_t error,
+                                int io_errno);
 
 /*
- * Serialize card reads and apply DMA low-water backpressure. ESP-IDF's
- * original SDSPI transaction lengths are preserved; arbitrary offsets are
- * handled by FatFs and the stock driver without changing bytes on the wire.
+ * Read through a permanently reserved internal/DMA-capable staging buffer.
+ * Large upload buffers live in PSRAM; passing them directly to SDSPI makes the
+ * IDF allocate a temporary internal RX buffer for every transaction.  A failed
+ * allocation enters a broken cleanup path in ESP-IDF 5.5.4, so all potentially
+ * external destinations must use this helper.
  */
 esp_err_t storage_sd_read(FILE *file, void *buffer, size_t wanted,
                           size_t *received);
-
-/* Positioned read helpers use the descriptor API exclusively. Do not mix
- * stdio fseek/ftell state with storage_sd_read(), which calls POSIX read(). */
-esp_err_t storage_sd_seek(FILE *file, uint32_t offset);
-esp_err_t storage_sd_size(FILE *file, size_t *size_out);
-
-/*
- * Prepare a WAV range before opening HTTP. The one-byte read materializes the
- * FatFs sector cache and validates the card while network memory is quiet.
- */
-esp_err_t storage_sd_prepare_range(FILE *file, uint32_t file_offset);
 
 /* Persistent counter + MAC + random suffix; prevents reset-time name collisions. */
 esp_err_t sd_session_generate_id(char *out, size_t out_size);

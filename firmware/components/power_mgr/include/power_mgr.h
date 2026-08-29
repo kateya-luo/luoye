@@ -12,7 +12,7 @@ typedef void (*power_post_fn)(app_event_t ev, int32_t arg);
 typedef struct {
   uint32_t sequence;
   int32_t gauge_soc_x256;
-  int16_t calibrated_soc;
+  int16_t mapped_soc;
   int16_t filtered_soc;
   int16_t displayed_soc;
   int16_t battery_mv;

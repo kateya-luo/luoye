@@ -19,7 +19,6 @@
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 
@@ -91,16 +90,6 @@ static void hook_set_timer(app_timer_id_t id, uint32_t ms) {
   esp_timer_start_once(s_timers[id], (uint64_t)ms * 1000);
 }
 static void hook_cancel_timer(app_timer_id_t id) { esp_timer_stop(s_timers[id]); }
-
-static bool hook_storage_format(void) {
-  esp_err_t error = storage_sd_format();
-  ESP_LOGI(TAG, "LY|STORAGE_FORMAT|event=request result=%s",
-           esp_err_to_name(error));
-  if (error != ESP_OK) return false;
-  vTaskDelay(pdMS_TO_TICKS(200));
-  esp_restart();
-  return true;
-}
 
 // ---------- 录音会话 hooks ----------
 // 只有四个会话文件均已同步、麦克风成功启动后才进入 RECORDING。
@@ -329,6 +318,19 @@ static bool idle_half_hour(void) {
          (utc.tm_min % 30) == 0;
 }
 
+static bool idle_top_of_hour(void) {
+  time_t now = time(NULL);
+  struct tm utc = {0};
+  return now >= 1577836800 && gmtime_r(&now, &utc) && utc.tm_min == 0;
+}
+
+static bool idle_ten_minute(void) {
+  time_t now = time(NULL);
+  struct tm utc = {0};
+  return now >= 1577836800 && gmtime_r(&now, &utc) &&
+         (utc.tm_min % 10) == 0;
+}
+
 static bool idle_stop_agenda_maintenance(void) {
   int64_t deadline = esp_timer_get_time() / 1000 +
                      IDLE_AGENDA_STOP_GRACE_MS;
@@ -391,9 +393,11 @@ static bool idle_light_sleep(void) {
                          state->charging == APP_CHG_NONE;
     const char *refresh = "none";
     bool half_hour = idle_half_hour();
+    bool top_of_hour = idle_top_of_hour();
+    bool ten_minute = idle_ten_minute();
+    bool agenda_changed = false;
     if (half_hour) {
       bool maintenance = net_idle_agenda_maintenance_start();
-      bool agenda_changed = false;
       if (maintenance) {
         int64_t deadline = esp_timer_get_time() / 1000 +
                            IDLE_AGENDA_MAINTENANCE_MS;
@@ -413,11 +417,18 @@ static bool idle_light_sleep(void) {
         }
         if (!idle_stop_agenda_maintenance()) return true;
       }
-      /* Coalesce the half-hour ghost cleanup with the newly downloaded
-         agenda, so a changed agenda never causes two consecutive repaints. */
+    }
+    /* Keep agenda maintenance every half hour, but decouple it from the
+       waveform schedule: xx:00 is FULL and every other 10-minute boundary
+       is FAST.  A changed agenda is folded into that one repaint. */
+    if (top_of_hour) {
       ui_request_render(APP_RENDER_FULL);
       ui_wait_idle(6000);
       refresh = agenda_changed ? "full+agenda" : "full";
+    } else if (ten_minute) {
+      ui_request_render(APP_RENDER_FAST);
+      ui_wait_idle(6000);
+      refresh = agenda_changed ? "fast+agenda" : "fast";
     } else if (clock_visible) {
       ui_request_render(APP_RENDER_CLOCK_PARTIAL);
       ui_wait_idle(6000);
@@ -511,7 +522,6 @@ void app_main(void) {
     .recording_close_status = hook_recording_close_status,
     .set_timer = hook_set_timer,
     .cancel_timer = hook_cancel_timer,
-    .storage_format = hook_storage_format,
   };
   app_state_init(&hooks);
 

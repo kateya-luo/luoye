@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "storage_sd.h"
 #include "freertos/FreeRTOS.h"
@@ -20,26 +21,92 @@
 #define MAX_JSON_BYTES (64U * 1024U)
 
 static SemaphoreHandle_t s_upload_lock;
+static char s_last_skipped_session[SD_UPLOAD_SESSION_ID_BYTES];
+static esp_err_t s_last_skipped_error = ESP_OK;
 
-static bool next_directory(DIR *root, char *directory, size_t directory_size,
-                           char *session_id, size_t session_id_size);
+static bool take_upload_lock_ready(void) {
+  if (!s_upload_lock ||
+      xSemaphoreTake(s_upload_lock, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+  /* The card may have faulted while this task waited for the metadata lock. */
+  if (!storage_sd_mounted()) {
+    xSemaphoreGive(s_upload_lock);
+    return false;
+  }
+  return true;
+}
+
+static esp_err_t next_directory(DIR *root, char *directory,
+                                size_t directory_size, char *session_id,
+                                size_t session_id_size, bool *found);
 static bool local_session_id_valid(const char *value);
+
+static bool active_open_session_is(const char *session_id) {
+  char active_id[SD_UPLOAD_SESSION_ID_BYTES] = {0};
+  bool closed = true;
+  return session_id && sd_session_current(NULL, 0, active_id,
+                                          sizeof(active_id), &closed, NULL) &&
+         !closed && strcmp(active_id, session_id) == 0;
+}
+
+static bool errno_is_storage_io(int value) {
+  return value == EIO || value == ENODEV || value == ENXIO ||
+         value == ETIMEDOUT;
+}
+
+static void report_scan_error(const char *source, int value) {
+  if (errno_is_storage_io(value)) {
+    storage_sd_report_io_fault(source, ESP_FAIL, value);
+  }
+}
+
+static void close_read_file(FILE *file) {
+  if (file && !storage_sd_faulted()) fclose(file);
+}
+
+static void report_preserved_logical_session(const char *session_id,
+                                             esp_err_t error) {
+  if (!session_id || !*session_id) return;
+  if (strcmp(s_last_skipped_session, session_id) == 0 &&
+      s_last_skipped_error == error) {
+    return;
+  }
+  snprintf(s_last_skipped_session, sizeof(s_last_skipped_session), "%s",
+           session_id);
+  s_last_skipped_error = error;
+  ESP_LOGW("upload_store",
+           "LY|UPLOAD_SCAN|id=%s result=logical_invalid esp=%s action=skip_preserve",
+           session_id, esp_err_to_name(error));
+}
 
 static cJSON *read_json(const char *path) {
   FILE *file = fopen(path, "rb");
-  if (!file) return NULL;
-  size_t length = 0;
-  if (storage_sd_size(file, &length) != ESP_OK || length > MAX_JSON_BYTES ||
-      storage_sd_seek(file, 0) != ESP_OK) {
-    fclose(file);
+  if (!file) {
+    report_scan_error("json_open", errno);
     return NULL;
   }
-  char *data = malloc(length + 1U);
-  if (!data) { fclose(file); return NULL; }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    report_scan_error("json_seek_end", errno);
+    close_read_file(file);
+    return NULL;
+  }
+  long length = ftell(file);
+  if (length < 0 || length > (long)MAX_JSON_BYTES ||
+      fseek(file, 0, SEEK_SET) != 0) {
+    if (length < 0) report_scan_error("json_tell", errno);
+    else if (length <= (long)MAX_JSON_BYTES) {
+      report_scan_error("json_seek_start", errno);
+    }
+    close_read_file(file);
+    return NULL;
+  }
+  char *data = malloc((size_t)length + 1U);
+  if (!data) { close_read_file(file); return NULL; }
   size_t got = 0;
-  esp_err_t read_result = storage_sd_read(file, data, length, &got);
-  fclose(file);
-  if (read_result != ESP_OK || got != length) {
+  esp_err_t read_result = storage_sd_read(file, data, (size_t)length, &got);
+  close_read_file(file);
+  if (read_result != ESP_OK || got != (size_t)length) {
     free(data);
     return NULL;
   }
@@ -52,6 +119,7 @@ static cJSON *read_json(const char *path) {
 static cJSON *read_json_with_backup(const char *path) {
   cJSON *root = read_json(path);
   if (root) return root;
+  if (storage_sd_faulted()) return NULL;
   char backup[PATH_BYTES];
   if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup)) {
     return NULL;
@@ -60,18 +128,44 @@ static cJSON *read_json_with_backup(const char *path) {
 }
 
 static esp_err_t sync_text(const char *path, const char *text) {
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   FILE *file = fopen(path, "wb");
-  if (!file) return ESP_FAIL;
+  if (!file) {
+    report_scan_error("state_open_write", errno);
+    return ESP_FAIL;
+  }
   size_t size = strlen(text);
+  int failure_errno = 0;
   esp_err_t result = fwrite(text, 1, size, file) == size ? ESP_OK : ESP_FAIL;
-  if (result == ESP_OK && fflush(file) != 0) result = ESP_FAIL;
+  if (result != ESP_OK) failure_errno = errno;
+  if (storage_sd_faulted()) return ESP_FAIL;
+  if (result == ESP_OK && fflush(file) != 0) {
+    result = ESP_FAIL;
+    failure_errno = errno;
+  }
+  if (storage_sd_faulted()) return ESP_FAIL;
   int fd = fileno(file);
-  if (result == ESP_OK && (fd < 0 || fsync(fd) != 0)) result = ESP_FAIL;
-  if (fclose(file) != 0 && result == ESP_OK) result = ESP_FAIL;
+  if (result == ESP_OK && (fd < 0 || fsync(fd) != 0)) {
+    result = ESP_FAIL;
+    failure_errno = errno;
+  }
+  if (storage_sd_faulted()) return ESP_FAIL;
+  if (result != ESP_OK) {
+    report_scan_error("state_write", failure_errno);
+    /* Once the card command stream is faulted, even fclose may flush or
+       update FAT metadata. Deliberately leak this handle until reboot. */
+    if (storage_sd_faulted()) return result;
+  }
+  if (fclose(file) != 0 && result == ESP_OK) {
+    failure_errno = errno;
+    result = ESP_FAIL;
+    report_scan_error("state_close", failure_errno);
+  }
   return result;
 }
 
 static esp_err_t write_json_atomic(const char *path, cJSON *root) {
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char *json = cJSON_PrintUnformatted(root);
   if (!json) return ESP_ERR_NO_MEM;
   cJSON *check = cJSON_Parse(json);
@@ -86,16 +180,42 @@ static esp_err_t write_json_atomic(const char *path, cJSON *root) {
   }
   esp_err_t result = sync_text(temp, json);
   cJSON_free(json);
-  if (result != ESP_OK) { unlink(temp); return result; }
-  unlink(backup);
-  bool had_current = access(path, F_OK) == 0;
-  if (had_current && rename(path, backup) != 0) {
-    unlink(temp);
+  if (result != ESP_OK) {
+    if (!storage_sd_faulted()) unlink(temp);
+    return result;
+  }
+  if (storage_sd_faulted()) return ESP_FAIL;
+  if (unlink(backup) != 0 && errno != ENOENT) {
+    int unlink_errno = errno;
+    report_scan_error("state_backup_unlink", unlink_errno);
+    if (!storage_sd_faulted()) unlink(temp);
     return ESP_FAIL;
   }
+  if (storage_sd_faulted()) return ESP_FAIL;
+  errno = 0;
+  int access_result = access(path, F_OK);
+  int access_errno = access_result == 0 ? 0 : errno;
+  if (access_result != 0 && access_errno != ENOENT) {
+    report_scan_error("state_current_access", access_errno);
+    if (!storage_sd_faulted()) unlink(temp);
+    return ESP_FAIL;
+  }
+  bool had_current = access_result == 0;
+  if (storage_sd_faulted()) return ESP_FAIL;
+  if (had_current && rename(path, backup) != 0) {
+    int rename_errno = errno;
+    report_scan_error("state_backup_rename", rename_errno);
+    if (!storage_sd_faulted()) unlink(temp);
+    return ESP_FAIL;
+  }
+  if (storage_sd_faulted()) return ESP_FAIL;
   if (rename(temp, path) != 0) {
-    if (had_current) rename(backup, path);
-    unlink(temp);
+    int rename_errno = errno;
+    report_scan_error("state_commit_rename", rename_errno);
+    if (!storage_sd_faulted()) {
+      if (had_current) rename(backup, path);
+      unlink(temp);
+    }
     return ESP_FAIL;
   }
   return ESP_OK;
@@ -155,7 +275,6 @@ static cJSON *new_state(const char *session_id) {
   cJSON_AddBoolToObject(root, "remote_session_created", false);
   cJSON_AddStringToObject(root, "server_session_id", "");
   cJSON_AddNumberToObject(root, "next_seq", 0);
-  cJSON_AddNumberToObject(root, "live_chunk_bytes", 0);
   cJSON_AddNumberToObject(root, "acked_pcm_bytes", 0);
   cJSON_AddNumberToObject(root, "gap_start_bytes", 0);
   cJSON_AddBoolToObject(root, "live_resume_required", false);
@@ -166,11 +285,6 @@ static cJSON *new_state(const char *session_id) {
   cJSON_AddNumberToObject(root, "retry_count", 0);
   cJSON_AddNumberToObject(root, "last_http_status", 0);
   cJSON_AddNumberToObject(root, "result_revision", 0);
-  cJSON_AddNumberToObject(root, "display_revision", 0);
-  cJSON_AddNumberToObject(root, "caption_revision", 0);
-  cJSON_AddNumberToObject(root, "speaker_revision", 0);
-  cJSON_AddNumberToObject(root, "translation_revision", 0);
-  cJSON_AddNumberToObject(root, "summary_revision", 0);
   cJSON_AddNumberToObject(root, "result_pcm_bytes", 0);
   return root;
 }
@@ -194,7 +308,6 @@ static esp_err_t mirror_manifest(const sd_upload_item_t *item) {
   set_string(upload, "mode", item->upload_mode[0] ? item->upload_mode : "live");
   set_bool(upload, "remote_session_created", item->remote_session_created);
   set_number(upload, "next_seq", item->next_seq);
-  set_number(upload, "live_chunk_bytes", item->live_chunk_bytes);
   set_number(upload, "acknowledged_bytes", item->acknowledged_bytes);
   set_number(upload, "gap_start_bytes", item->gap_start_bytes);
   set_bool(upload, "live_resume_required", item->live_resume_required);
@@ -205,11 +318,6 @@ static esp_err_t mirror_manifest(const sd_upload_item_t *item) {
   set_number(upload, "retry_count", item->retry_count);
   set_number(upload, "last_http_status", item->last_http_status);
   set_number(upload, "result_revision", item->result_revision);
-  set_number(upload, "display_revision", item->display_revision);
-  set_number(upload, "caption_revision", item->caption_revision);
-  set_number(upload, "speaker_revision", item->speaker_revision);
-  set_number(upload, "translation_revision", item->translation_revision);
-  set_number(upload, "summary_revision", item->summary_revision);
   set_number(upload, "result_pcm_bytes", item->result_pcm_bytes);
   esp_err_t result = write_json_atomic(path, root);
   cJSON_Delete(root);
@@ -252,7 +360,12 @@ static esp_err_t load_item(const char *directory, const char *session_id,
   char wav_path[PATH_BYTES], state_path[PATH_BYTES];
   snprintf(wav_path, sizeof(wav_path), "%s/audio.wav", directory);
   struct stat wav;
-  if (stat(wav_path, &wav) != 0 || wav.st_size < 44) return ESP_ERR_NOT_FOUND;
+  if (stat(wav_path, &wav) != 0) {
+    int stat_errno = errno;
+    report_scan_error("audio_stat", stat_errno);
+    return stat_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
+  if (wav.st_size < 44) return ESP_ERR_NOT_FOUND;
   uint64_t actual_pcm = (uint64_t)wav.st_size - 44U;
   uint64_t pcm = closed ? actual_pcm : safe_pcm_bytes;
   if (!closed && pcm > actual_pcm) return ESP_ERR_INVALID_STATE;
@@ -261,6 +374,7 @@ static esp_err_t load_item(const char *directory, const char *session_id,
 
   snprintf(state_path, sizeof(state_path), "%s/upload.state", directory);
   cJSON *root = read_json_with_backup(state_path);
+  if (!root && storage_sd_faulted()) return ESP_FAIL;
   if (!root) root = new_state(session_id);
   if (!root) return ESP_ERR_NO_MEM;
   copy_json_string(root, "server_session_id", item->server_session_id,
@@ -274,17 +388,11 @@ static esp_err_t load_item(const char *directory, const char *session_id,
   }
   item->binding_generation = json_u32(root, "binding_generation");
   item->next_seq = json_u32(root, "next_seq");
-  item->live_chunk_bytes = json_u32(root, "live_chunk_bytes");
   item->acknowledged_bytes = json_u32(root, "acked_pcm_bytes");
   item->gap_start_bytes = json_u32(root, "gap_start_bytes");
   item->retry_count = json_u32(root, "retry_count");
   item->last_http_status = (int)json_u32(root, "last_http_status");
   item->result_revision = json_u32(root, "result_revision");
-  item->display_revision = json_u32(root, "display_revision");
-  item->caption_revision = json_u32(root, "caption_revision");
-  item->speaker_revision = json_u32(root, "speaker_revision");
-  item->translation_revision = json_u32(root, "translation_revision");
-  item->summary_revision = json_u32(root, "summary_revision");
   item->result_pcm_bytes = json_u32(root, "result_pcm_bytes");
   item->remote_session_created = json_bool(root, "remote_session_created");
   item->marks_acked = json_bool(root, "marks_acked");
@@ -311,10 +419,11 @@ esp_err_t sd_upload_assign_identity(const char *session_id,
   if (!s_upload_lock || !session_id || !*session_id || !device_id) {
     return ESP_ERR_INVALID_ARG;
   }
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char directory[SD_UPLOAD_DIR_BYTES], path[PATH_BYTES];
   snprintf(directory, sizeof(directory), SESSION_ROOT "/%s", session_id);
   snprintf(path, sizeof(path), "%s/upload.state", directory);
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   cJSON *root = read_json_with_backup(path);
   if (!root) root = new_state(session_id);
   esp_err_t result = root ? ESP_OK : ESP_ERR_NO_MEM;
@@ -341,44 +450,103 @@ esp_err_t sd_upload_assign_identity(const char *session_id,
   return result;
 }
 
-static bool next_directory(DIR *root, char *directory, size_t directory_size,
-                           char *session_id, size_t session_id_size) {
-  struct dirent *entry;
-  while ((entry = readdir(root)) != NULL) {
+static esp_err_t next_directory(DIR *root, char *directory,
+                                size_t directory_size, char *session_id,
+                                size_t session_id_size, bool *found) {
+  if (!root || !directory || !session_id || !found) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *found = false;
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(root);
+    if (!entry) {
+      int read_errno = errno;
+      if (!read_errno) return ESP_ERR_NOT_FOUND;
+      report_scan_error("session_readdir", read_errno);
+      return ESP_FAIL;
+    }
     if (entry->d_name[0] == '.' ||
         strlen(entry->d_name) >= session_id_size) continue;
     snprintf(directory, directory_size, SESSION_ROOT "/%s", entry->d_name);
     struct stat st;
-    if (stat(directory, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+    if (stat(directory, &st) != 0) {
+      int stat_errno = errno;
+      if (stat_errno == ENOENT) continue;
+      report_scan_error("session_stat", stat_errno);
+      return ESP_FAIL;
+    }
+    if (!S_ISDIR(st.st_mode)) continue;
     snprintf(session_id, session_id_size, "%s", entry->d_name);
-    return true;
+    *found = true;
+    return ESP_OK;
   }
-  return false;
 }
 
 esp_err_t sd_upload_next(uint32_t binding_generation, sd_upload_item_t *out) {
   if (!s_upload_lock || !out || binding_generation == 0) return ESP_ERR_INVALID_ARG;
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   DIR *root = opendir(SESSION_ROOT);
-  if (!root) { xSemaphoreGive(s_upload_lock); return ESP_ERR_NOT_FOUND; }
+  if (!root) {
+    int open_errno = errno;
+    xSemaphoreGive(s_upload_lock);
+    if (open_errno == ENOENT) return ESP_ERR_NOT_FOUND;
+    report_scan_error("session_opendir", open_errno);
+    return ESP_FAIL;
+  }
   esp_err_t result = ESP_ERR_NOT_FOUND;
+  esp_err_t preserved_logical_error = ESP_OK;
+  bool have_oldest = false;
   sd_upload_item_t oldest = {0};
   char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
-  while (next_directory(root, directory, sizeof(directory),
-                        session_id, sizeof(session_id))) {
+  for (;;) {
+    bool found = false;
+    esp_err_t scan = next_directory(root, directory, sizeof(directory),
+                                    session_id, sizeof(session_id), &found);
+    if (scan == ESP_ERR_NOT_FOUND) break;
+    if (scan != ESP_OK || !found) {
+      result = scan == ESP_OK ? ESP_FAIL : scan;
+      break;
+    }
     sd_upload_item_t item;
-    if (load_item(directory, session_id, false, 0, &item) != ESP_OK) continue;
+    esp_err_t load_result = load_item(directory, session_id, false, 0, &item);
+    if (load_result != ESP_OK) {
+      if (storage_sd_faulted()) {
+        result = ESP_FAIL;
+        break;
+      }
+      if (active_open_session_is(session_id)) continue;
+      if (load_result == ESP_ERR_NO_MEM) {
+        result = load_result;
+        break;
+      }
+      report_preserved_logical_session(session_id, load_result);
+      if (preserved_logical_error == ESP_OK) {
+        /* ESP_ERR_NOT_FOUND means this directory is incomplete, not that the
+           complete session scan reached END. Keep those states distinct so
+           manual sync cannot report a false success. */
+        preserved_logical_error = load_result == ESP_ERR_NOT_FOUND
+                                      ? ESP_ERR_INVALID_STATE : load_result;
+      }
+      continue;
+    }
     if (item.binding_generation != binding_generation) continue;
     if (!item.device_id[0] || strcmp(item.state, "permanent_error") == 0) continue;
-    if (result != ESP_OK || item.started_at_utc < oldest.started_at_utc ||
+    if (!have_oldest || item.started_at_utc < oldest.started_at_utc ||
         (item.started_at_utc == oldest.started_at_utc &&
          strcmp(item.session_id, oldest.session_id) < 0)) {
       oldest = item;
-      result = ESP_OK;
+      have_oldest = true;
     }
   }
   closedir(root);
-  if (result == ESP_OK) *out = oldest;
+  if (result != ESP_FAIL && result != ESP_ERR_NO_MEM) {
+    result = have_oldest ? ESP_OK :
+             (preserved_logical_error != ESP_OK
+                ? preserved_logical_error : ESP_ERR_NOT_FOUND);
+  }
+  if (have_oldest && result == ESP_OK) *out = oldest;
   xSemaphoreGive(s_upload_lock);
   return result;
 }
@@ -388,10 +556,11 @@ esp_err_t sd_upload_find(uint32_t binding_generation,
                          sd_upload_item_t *out) {
   if (!s_upload_lock || !binding_generation || !local_session_id_valid(session_id) ||
       !out) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char directory[SD_UPLOAD_DIR_BYTES];
   if (snprintf(directory, sizeof(directory), SESSION_ROOT "/%s", session_id) >=
       (int)sizeof(directory)) return ESP_ERR_INVALID_SIZE;
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   sd_upload_item_t item;
   esp_err_t result = load_item(directory, session_id, false, 0, &item);
   if (result == ESP_OK &&
@@ -405,6 +574,7 @@ esp_err_t sd_upload_find(uint32_t binding_generation,
 
 esp_err_t sd_upload_current(uint32_t binding_generation, sd_upload_item_t *out) {
   if (!s_upload_lock || !out || binding_generation == 0) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
   bool closed = false;
   uint32_t safe_pcm_bytes = 0;
@@ -412,7 +582,7 @@ esp_err_t sd_upload_current(uint32_t binding_generation, sd_upload_item_t *out) 
                           sizeof(session_id), &closed, &safe_pcm_bytes) || closed) {
     return ESP_ERR_NOT_FOUND;
   }
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   sd_upload_item_t item;
   esp_err_t result = load_item(directory, session_id, true, safe_pcm_bytes, &item);
   if (result == ESP_OK &&
@@ -425,62 +595,56 @@ esp_err_t sd_upload_current(uint32_t binding_generation, sd_upload_item_t *out) 
   return result;
 }
 
-esp_err_t sd_upload_refresh_current(sd_upload_item_t *item) {
-  if (!item || !item->session_id[0]) return ESP_ERR_INVALID_ARG;
-  char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
-  bool closed = false;
-  uint32_t safe_pcm_bytes = 0;
-  if (!sd_session_current(directory, sizeof(directory), session_id,
-                          sizeof(session_id), &closed, &safe_pcm_bytes) ||
-      strcmp(session_id, item->session_id) != 0 ||
-      strcmp(directory, item->directory) != 0) {
-    return ESP_ERR_NOT_FOUND;
-  }
-  if (safe_pcm_bytes < item->acknowledged_bytes) return ESP_ERR_INVALID_STATE;
-
-  bool became_closed = closed && !item->local_closed;
-  item->pcm_bytes = safe_pcm_bytes;
-  item->local_closed = closed;
-  if (became_closed) {
-    /* session.json is committed before storage publishes closed=true.  Read
-       only its immutable close metadata; never replace the newer RAM upload
-       cursor with the deliberately older upload.state checkpoint. */
-    xSemaphoreTake(s_upload_lock, portMAX_DELAY);
-    sd_upload_item_t metadata = *item;
-    bool manifest_closed = false;
-    bool valid = manifest_metadata(directory, &metadata, true,
-                                   &manifest_closed) && manifest_closed;
-    xSemaphoreGive(s_upload_lock);
-    if (!valid) return ESP_ERR_INVALID_STATE;
-    item->ended_at_utc = metadata.ended_at_utc;
-    snprintf(item->scene, sizeof(item->scene), "%s", metadata.scene);
-    snprintf(item->title, sizeof(item->title), "%s", metadata.title);
-  }
-  return ESP_OK;
-}
-
 esp_err_t sd_upload_backlog(uint32_t *session_count, uint64_t *pending_bytes) {
   if (!s_upload_lock) return ESP_ERR_INVALID_STATE;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   uint32_t sessions = 0;
   uint64_t bytes = 0;
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   DIR *root = opendir(SESSION_ROOT);
-  if (root) {
+  esp_err_t result = ESP_OK;
+  if (!root) {
+    int open_errno = errno;
+    result = open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    if (result == ESP_FAIL) report_scan_error("backlog_opendir", open_errno);
+  } else {
     char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
-    while (next_directory(root, directory, sizeof(directory),
-                          session_id, sizeof(session_id))) {
+    for (;;) {
+      bool found = false;
+      esp_err_t scan = next_directory(root, directory, sizeof(directory),
+                                      session_id, sizeof(session_id), &found);
+      if (scan == ESP_ERR_NOT_FOUND) break;
+      if (scan != ESP_OK || !found) {
+        result = scan == ESP_OK ? ESP_FAIL : scan;
+        break;
+      }
       sd_upload_item_t item;
-      if (load_item(directory, session_id, false, 0, &item) != ESP_OK ||
-          item.final_acked) continue;
+      esp_err_t load_result = load_item(directory, session_id, false, 0, &item);
+      if (load_result != ESP_OK) {
+        if (storage_sd_faulted()) {
+          result = ESP_FAIL;
+          break;
+        }
+        if (!active_open_session_is(session_id)) {
+          report_preserved_logical_session(session_id, load_result);
+          /* Preserve visibility that local material still needs attention,
+             while allowing healthy meetings to continue uploading. */
+          sessions++;
+        }
+        continue;
+      }
+      if (item.final_acked) continue;
       sessions++;
       bytes += item.pcm_bytes - item.acknowledged_bytes;
     }
     closedir(root);
   }
   xSemaphoreGive(s_upload_lock);
-  if (session_count) *session_count = sessions;
-  if (pending_bytes) *pending_bytes = bytes;
-  return root ? ESP_OK : ESP_ERR_NOT_FOUND;
+  if (result == ESP_OK || result == ESP_ERR_NOT_FOUND) {
+    if (session_count) *session_count = sessions;
+    if (pending_bytes) *pending_bytes = bytes;
+  }
+  return result;
 }
 
 esp_err_t sd_upload_read_audio(const sd_upload_item_t *item,
@@ -488,60 +652,21 @@ esp_err_t sd_upload_read_audio(const sd_upload_item_t *item,
                                size_t wanted, size_t *received) {
   if (!item || !buffer || !received || offset > item->pcm_bytes ||
       wanted > item->pcm_bytes - offset) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[PATH_BYTES];
   snprintf(path, sizeof(path), "%s/audio.wav", item->directory);
   FILE *file = fopen(path, "rb");
-  if (!file) return ESP_ERR_NOT_FOUND;
-  esp_err_t result = storage_sd_seek(file, 44U + offset);
+  if (!file) {
+    int open_errno = errno;
+    report_scan_error("audio_open", open_errno);
+    return open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
+  esp_err_t result = fseek(file, 44L + (long)offset, SEEK_SET) == 0 ? ESP_OK : ESP_FAIL;
+  if (result != ESP_OK) report_scan_error("audio_seek", errno);
   if (result == ESP_OK) result = storage_sd_read(file, buffer, wanted, received);
   else *received = 0;
-  fclose(file);
+  close_read_file(file);
   return result == ESP_OK && *received == wanted ? ESP_OK : ESP_FAIL;
-}
-
-void sd_upload_reader_close(sd_upload_reader_t *reader) {
-  if (!reader) return;
-  if (reader->file) fclose(reader->file);
-  memset(reader, 0, sizeof(*reader));
-}
-
-esp_err_t sd_upload_reader_read(sd_upload_reader_t *reader,
-                                const sd_upload_item_t *item,
-                                uint32_t offset, void *buffer,
-                                size_t wanted, size_t *received) {
-  if (!reader || !item || !buffer || !received ||
-      offset > item->pcm_bytes || wanted > item->pcm_bytes - offset) {
-    return ESP_ERR_INVALID_ARG;
-  }
-  if (reader->file && strcmp(reader->session_id, item->session_id) != 0) {
-    sd_upload_reader_close(reader);
-  }
-  if (!reader->file) {
-    char path[PATH_BYTES];
-    snprintf(path, sizeof(path), "%s/audio.wav", item->directory);
-    reader->file = fopen(path, "rb");
-    if (!reader->file) return ESP_ERR_NOT_FOUND;
-    snprintf(reader->session_id, sizeof(reader->session_id), "%s",
-             item->session_id);
-    reader->file_offset = 0;
-  }
-
-  uint32_t target = 44U + offset;
-  if (reader->file_offset != target) {
-    esp_err_t seek_error = storage_sd_seek(reader->file, target);
-    if (seek_error != ESP_OK) {
-      sd_upload_reader_close(reader);
-      return seek_error;
-    }
-    reader->file_offset = target;
-  }
-  esp_err_t result = storage_sd_read(reader->file, buffer, wanted, received);
-  if (result == ESP_OK && *received == wanted) {
-    reader->file_offset += (uint32_t)*received;
-    return ESP_OK;
-  }
-  sd_upload_reader_close(reader);
-  return result == ESP_OK ? ESP_FAIL : result;
 }
 
 static bool sha256_hex_valid(const char *value) {
@@ -557,16 +682,22 @@ esp_err_t sd_upload_range_sha256(const sd_upload_item_t *item,
                                  char sha256[SD_UPLOAD_SHA256_HEX_BYTES]) {
   if (!item || !sha256 || !length || offset > item->pcm_bytes ||
       length > item->pcm_bytes - offset) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[PATH_BYTES];
   snprintf(path, sizeof(path), "%s/%s", item->directory,
            SD_UPLOAD_RANGE_HASH_FILE);
   FILE *file = fopen(path, "rb");
-  if (!file) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  if (!file) {
+    int open_errno = errno;
+    report_scan_error("range_hash_open", open_errno);
+    return open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
 
   unsigned long row_offset = 0;
   unsigned long row_length = 0;
   char digest[SD_UPLOAD_SHA256_HEX_BYTES] = {0};
   esp_err_t result = ESP_ERR_NOT_FOUND;
+  errno = 0;
   while (fscanf(file, "%lu %lu %64s", &row_offset, &row_length, digest) == 3) {
     if (row_offset == offset && row_length == length &&
         sha256_hex_valid(digest)) {
@@ -577,7 +708,12 @@ esp_err_t sd_upload_range_sha256(const sd_upload_item_t *item,
       break;
     }
   }
-  fclose(file);
+  if (ferror(file)) {
+    int read_errno = errno;
+    report_scan_error("range_hash_read", read_errno);
+    result = ESP_FAIL;
+  }
+  close_read_file(file);
   return result;
 }
 
@@ -585,19 +721,31 @@ esp_err_t sd_upload_read_marks(const sd_upload_item_t *item,
                                void *buffer, size_t capacity,
                                size_t *received) {
   if (!item || !buffer || !capacity || !received) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[PATH_BYTES];
   snprintf(path, sizeof(path), "%s/marks.jsonl", item->directory);
   FILE *file = fopen(path, "rb");
-  if (!file) return ESP_ERR_NOT_FOUND;
-  size_t size = 0;
-  if (storage_sd_size(file, &size) != ESP_OK || size > capacity ||
-      storage_sd_seek(file, 0) != ESP_OK) {
-    fclose(file);
+  if (!file) {
+    int open_errno = errno;
+    report_scan_error("marks_open", open_errno);
+    return open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    report_scan_error("marks_seek_end", errno);
+    close_read_file(file);
+    return ESP_FAIL;
+  }
+  long size = ftell(file);
+  if (size < 0 || (size_t)size > capacity || fseek(file, 0, SEEK_SET) != 0) {
+    if (size < 0 || (size_t)size <= capacity) {
+      report_scan_error("marks_seek_start", errno);
+    }
+    close_read_file(file);
     return ESP_ERR_INVALID_SIZE;
   }
-  esp_err_t result = storage_sd_read(file, buffer, size, received);
-  fclose(file);
-  return result == ESP_OK && *received == size ? ESP_OK : ESP_FAIL;
+  esp_err_t result = storage_sd_read(file, buffer, (size_t)size, received);
+  close_read_file(file);
+  return result == ESP_OK && *received == (size_t)size ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t sd_upload_save(sd_upload_item_t *item) {
@@ -606,9 +754,10 @@ esp_err_t sd_upload_save(sd_upload_item_t *item) {
       (item->remote_session_created && !item->server_session_id[0])) {
     return ESP_ERR_INVALID_ARG;
   }
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[PATH_BYTES];
   snprintf(path, sizeof(path), "%s/upload.state", item->directory);
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   cJSON *root = read_json_with_backup(path);
   if (!root) root = new_state(item->session_id);
   esp_err_t result = root ? ESP_OK : ESP_ERR_NO_MEM;
@@ -623,7 +772,6 @@ esp_err_t sd_upload_save(sd_upload_item_t *item) {
     set_bool(root, "remote_session_created", item->remote_session_created);
     set_string(root, "server_session_id", item->server_session_id);
     set_number(root, "next_seq", item->next_seq);
-    set_number(root, "live_chunk_bytes", item->live_chunk_bytes);
     set_number(root, "acked_pcm_bytes", item->acknowledged_bytes);
     set_number(root, "gap_start_bytes", item->gap_start_bytes);
     set_bool(root, "live_resume_required", item->live_resume_required);
@@ -634,11 +782,6 @@ esp_err_t sd_upload_save(sd_upload_item_t *item) {
     set_number(root, "retry_count", item->retry_count);
     set_number(root, "last_http_status", item->last_http_status);
     set_number(root, "result_revision", item->result_revision);
-    set_number(root, "display_revision", item->display_revision);
-    set_number(root, "caption_revision", item->caption_revision);
-    set_number(root, "speaker_revision", item->speaker_revision);
-    set_number(root, "translation_revision", item->translation_revision);
-    set_number(root, "summary_revision", item->summary_revision);
     set_number(root, "result_pcm_bytes", item->result_pcm_bytes);
     result = write_json_atomic(path, root);
     cJSON_Delete(root);
@@ -680,6 +823,7 @@ static uint64_t directory_bytes(const char *directory) {
 }
 
 esp_err_t sd_storage_info(uint64_t *total_bytes, uint64_t *free_bytes) {
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   uint64_t total = 0, free_space = 0;
   esp_err_t result = esp_vfs_fat_info("/sdcard", &total, &free_space);
   if (result == ESP_OK) {
@@ -719,8 +863,9 @@ esp_err_t sd_storage_inventory_page(uint32_t binding_generation,
   *complete = true;
   next_cursor[0] = '\0';
   const char *after = after_session_id ? after_session_id : "";
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
 
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   DIR *root = opendir(SESSION_ROOT);
   if (!root) {
     xSemaphoreGive(s_upload_lock);
@@ -728,8 +873,16 @@ esp_err_t sd_storage_inventory_page(uint32_t binding_generation,
   }
   size_t eligible = 0;
   char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
-  while (next_directory(root, directory, sizeof(directory),
-                        session_id, sizeof(session_id))) {
+  esp_err_t result = ESP_OK;
+  for (;;) {
+    bool found = false;
+    esp_err_t scan = next_directory(root, directory, sizeof(directory),
+                                    session_id, sizeof(session_id), &found);
+    if (scan == ESP_ERR_NOT_FOUND) break;
+    if (scan != ESP_OK || !found) {
+      result = scan == ESP_OK ? ESP_FAIL : scan;
+      break;
+    }
     if (strcmp(session_id, after) <= 0) continue;
     sd_upload_item_t item;
     if (load_item(directory, session_id, false, 0, &item) != ESP_OK ||
@@ -746,6 +899,10 @@ esp_err_t sd_storage_inventory_page(uint32_t binding_generation,
     inventory_insert(items, capacity, count, &candidate);
   }
   closedir(root);
+  if (result != ESP_OK) {
+    xSemaphoreGive(s_upload_lock);
+    return result;
+  }
   *complete = eligible <= capacity;
   if (*count) {
     snprintf(next_cursor, next_cursor_size, "%s", items[*count - 1U].session_id);
@@ -856,8 +1013,9 @@ esp_err_t sd_storage_delete_local(uint32_t binding_generation,
                                   const char *session_id,
                                   uint64_t *freed_bytes) {
   if (!s_upload_lock || !binding_generation) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   if (freed_bytes) *freed_bytes = 0;
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   esp_err_t result = delete_session_locked(binding_generation, session_id,
                                            freed_bytes);
   xSemaphoreGive(s_upload_lock);
@@ -868,11 +1026,12 @@ esp_err_t sd_storage_delete_all_local(uint32_t binding_generation,
                                       uint32_t *deleted_count,
                                       uint64_t *freed_bytes) {
   if (!s_upload_lock || !binding_generation) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   uint32_t deleted = 0;
   uint64_t freed = 0;
   bool active_deferred = false;
   esp_err_t result = ESP_OK;
-  xSemaphoreTake(s_upload_lock, portMAX_DELAY);
+  if (!take_upload_lock_ready()) return ESP_ERR_INVALID_STATE;
   for (;;) {
     char active_id[SD_UPLOAD_SESSION_ID_BYTES] = {0};
     bool active_closed = true;
@@ -884,8 +1043,15 @@ esp_err_t sd_storage_delete_all_local(uint32_t binding_generation,
     if (!root) break;
     char selected[SD_UPLOAD_SESSION_ID_BYTES] = {0};
     char directory[SD_UPLOAD_DIR_BYTES], session_id[SD_UPLOAD_SESSION_ID_BYTES];
-    while (next_directory(root, directory, sizeof(directory),
-                          session_id, sizeof(session_id))) {
+    for (;;) {
+      bool found = false;
+      esp_err_t scan = next_directory(root, directory, sizeof(directory),
+                                      session_id, sizeof(session_id), &found);
+      if (scan == ESP_ERR_NOT_FOUND) break;
+      if (scan != ESP_OK || !found) {
+        result = scan == ESP_OK ? ESP_FAIL : scan;
+        break;
+      }
       sd_upload_item_t item;
       if (load_item(directory, session_id, false, 0, &item) != ESP_OK ||
           item.binding_generation != binding_generation) continue;
@@ -898,6 +1064,7 @@ esp_err_t sd_storage_delete_all_local(uint32_t binding_generation,
       }
     }
     closedir(root);
+    if (result != ESP_OK) break;
     if (!selected[0]) break;
     uint64_t one = 0;
     result = delete_session_locked(binding_generation, selected, &one);

@@ -16,7 +16,6 @@ import re
 import secrets
 import sqlite3
 import struct
-import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import suppress
@@ -41,7 +40,7 @@ from .translator import dominant_lang
 logger = logging.getLogger("ai_recorder.device_v2")
 
 API_CONTRACT = "luoye-device-api/2"
-SERVER_RELEASE = os.getenv("SERVER_RELEASE", "clearmeeting-server-v1.0.1")
+SERVER_RELEASE = os.getenv("SERVER_RELEASE", "clearmeeting-server-v0.21.0")
 DEVICE_AUTH_PROFILE = os.getenv("DEVICE_AUTH_PROFILE", "engineering").strip().lower()
 if DEVICE_AUTH_PROFILE != "engineering":
     raise RuntimeError(
@@ -50,9 +49,9 @@ if DEVICE_AUTH_PROFILE != "engineering":
 PAIRING_TTL_SECONDS = max(60, int(os.getenv("DEVICE_PAIRING_TTL_SECONDS", "600")))
 DEVICE_TOKEN_TTL_SECONDS = max(3600, int(os.getenv("DEVICE_TOKEN_TTL_SECONDS", str(365 * 86400))))
 ONLINE_WINDOW_SECONDS = max(15, int(os.getenv("DEVICE_ONLINE_WINDOW_SECONDS", "90")))
-# Online PCM chunks may vary in size (V2.0.0 uses 32 KiB; older firmware uses
-# 160 KiB).  Operations may raise these ceilings, never configure them below
-# what a conforming legacy device must be able to send.
+# Protocol v1 firmware has fixed 160 KiB audio chunks and a ~938 KiB voice
+# todo buffer.  Operations may raise these ceilings, never configure them below
+# what a conforming device must be able to send.
 MAX_CHUNK_BYTES = max(163_840, int(os.getenv("DEVICE_MAX_CHUNK_BYTES", str(1024 * 1024))))
 RANGE_BLOCK_BYTES = 10 * 1024 * 1024
 MAX_RANGE_BYTES = RANGE_BLOCK_BYTES
@@ -64,11 +63,6 @@ LIVE_ASR_START_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("DEVICE_LIVE_ASR_START_TIMEOUT_SECONDS", "5")))
 LIVE_ASR_SEND_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("DEVICE_LIVE_ASR_SEND_TIMEOUT_SECONDS", "5")))
-LIVE_RESULT_WAIT_SECONDS = max(
-    0.0, min(1.0, float(os.getenv("DEVICE_LIVE_RESULT_WAIT_SECONDS", "0.45"))))
-PARTIAL_CAPTION_MAX_BYTES = 512
-PARTIAL_CAPTION_TTL_SECONDS = max(
-    5, int(os.getenv("DEVICE_PARTIAL_CAPTION_TTL_SECONDS", "15")))
 DEVICE_ID_RE = re.compile(r"^LY-[0-9A-F]{12}$")
 HEX_32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -135,19 +129,6 @@ def device_text(value: Any, max_utf8_bytes: int) -> str:
     clean = "".join(ch for ch in str(value or "")
                     if 0x20 <= ord(ch) <= 0xFFFF and not 0x7F <= ord(ch) <= 0x9F)
     raw = clean.encode("utf-8")[:max_utf8_bytes]
-    while raw:
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raw = raw[:-1]
-    return ""
-
-
-def partial_caption_text(value: Any) -> str:
-    """Return a control-free UTF-8 hypothesis bounded on a codepoint edge."""
-    clean = "".join(ch for ch in str(value or "")
-                    if ord(ch) >= 0x20 and not 0x7F <= ord(ch) <= 0x9F)
-    raw = clean.encode("utf-8")[:PARTIAL_CAPTION_MAX_BYTES]
     while raw:
         try:
             return raw.decode("utf-8")
@@ -371,7 +352,6 @@ class DeviceService:
                  on_audio_range_committed: Callable[[str], Awaitable[None]] | None = None,
                  offline_progress: Callable[[str], dict[str, Any]] | None = None,
                  on_live_caption: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
-                 on_live_partial: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
                  on_mark: Callable[[str], Awaitable[None]] | None = None
                  ) -> None:
         self.storage = storage
@@ -380,7 +360,6 @@ class DeviceService:
         self.on_audio_range_committed = on_audio_range_committed
         self.offline_progress = offline_progress
         self.on_live_caption = on_live_caption
-        self.on_live_partial = on_live_partial
         self.on_mark = on_mark
         secret = os.getenv("DEVICE_API_SECRET", "").strip() or self.db.get_meta("device_api_v1_secret")
         if not secret:
@@ -395,34 +374,10 @@ class DeviceService:
         self.range_root.mkdir(parents=True, exist_ok=True)
         self._live: dict[str, DeviceLiveRuntime] = {}
         self._live_init_locks: dict[str, asyncio.Lock] = {}
-        self._live_feed_tasks: dict[str, asyncio.Task] = {}
-        self._live_feed_pending: dict[str, tuple[int, int]] = {}
         self._live_disabled: set[str] = set()
         self._range_locks: dict[str, asyncio.Lock] = {}
         self._translation_llm = DeepSeekClient()
         self._callback_tasks: set[asyncio.Task] = set()
-        self._callback_locks: dict[str, asyncio.Lock] = {}
-        self._clear_restart_partials()
-
-    def _clear_restart_partials(self) -> None:
-        """Never expose a pre-restart, unconfirmed hypothesis as current."""
-        now = iso_now()
-        with self.db.transaction() as conn:
-            rows = conn.execute(
-                "SELECT server_session_id,display_revision FROM device_sessions"
-                " WHERE partial_caption!=''").fetchall()
-            for row in rows:
-                display_revision = int(row["display_revision"]) + 1
-                conn.execute(
-                    "UPDATE device_sessions SET partial_caption='',partial_start_ms=0,"
-                    "partial_end_ms=0,partial_updated_at=NULL,display_revision=?,updated_at=?"
-                    " WHERE server_session_id=?",
-                    (display_revision, now, row["server_session_id"]))
-                self._insert_display_event(
-                    conn, str(row["server_session_id"]), display_revision,
-                    kind="clear", created_at=now)
-        if rows:
-            logger.info("device_live_partial_restart_cleared sessions=%d", len(rows))
 
     async def _notify_audio_range_committed(self, session_id: str) -> None:
         if self.on_audio_range_committed is None:
@@ -437,8 +392,7 @@ class DeviceService:
     def _notify_live_caption(self, session_id: str, caption: dict[str, Any]) -> None:
         if self.on_live_caption is None:
             return
-        task = asyncio.create_task(self._dispatch_live_callback(
-            session_id, self.on_live_caption, caption))
+        task = asyncio.create_task(self.on_live_caption(session_id, caption))
         self._callback_tasks.add(task)
 
         def done(completed: asyncio.Task) -> None:
@@ -452,56 +406,6 @@ class DeviceService:
 
         task.add_done_callback(done)
 
-    def _notify_live_partial(self, session_id: str, partial: dict[str, Any]) -> None:
-        if self.on_live_partial is None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        task = loop.create_task(self._dispatch_live_callback(
-            session_id, self.on_live_partial, partial))
-        self._callback_tasks.add(task)
-
-        def done(completed: asyncio.Task) -> None:
-            self._callback_tasks.discard(completed)
-            if completed.cancelled():
-                return
-            error = completed.exception()
-            if error is not None:
-                logger.error("device_live_partial_callback_failed session=%s error=%s",
-                             session_id, error, exc_info=error)
-
-        task.add_done_callback(done)
-
-    async def _dispatch_live_callback(
-            self, session_id: str,
-            callback: Callable[[str, dict[str, Any]], Awaitable[None]],
-            payload: dict[str, Any]) -> None:
-        lock = self._callback_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            await callback(session_id, payload)
-
-    @staticmethod
-    def _insert_display_event(conn: Any, session_id: str, display_revision: int, *,
-                              kind: str, text: str = "", start_ms: int = 0,
-                              end_ms: int = 0, seg_id: str | None = None,
-                              caption_revision: int = 0,
-                              created_at: str | None = None) -> None:
-        conn.execute(
-            "INSERT INTO device_display_events(server_session_id,display_revision,kind,text,"
-            "start_ms,end_ms,seg_id,caption_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (session_id, display_revision, kind, partial_caption_text(text),
-             max(0, int(start_ms)), max(0, int(end_ms)), seg_id,
-             max(0, int(caption_revision)), created_at or iso_now()))
-        # The recorder acknowledges consumed events through
-        # after_display_revision.  This hard ceiling only protects sessions
-        # that never acknowledge (old firmware or abandoned recordings).
-        conn.execute(
-            "DELETE FROM device_display_events WHERE server_session_id=?"
-            " AND display_revision <= ?",
-            (session_id, max(0, display_revision - 256)))
-
     @staticmethod
     def _translation_target(value: str | None) -> str | None:
         value = str(value or "").strip().lower().replace("_", "-")
@@ -509,9 +413,7 @@ class DeviceService:
             return None
         return value.split("-", 1)[0]
 
-    async def _ensure_live_runtime(self, session: Any, *, start_seq: int | None = None,
-                                   start_sample: int | None = None
-                                   ) -> DeviceLiveRuntime | None:
+    async def _ensure_live_runtime(self, session: Any) -> DeviceLiveRuntime | None:
         """Start streaming ASR at the current durable contiguous cursor.
 
         Initialising at the already-acknowledged cursor is intentional.  If
@@ -531,12 +433,9 @@ class DeviceService:
             if runtime is not None:
                 return runtime
             progress = self._live_progress(session_id)
-            cursor = (int(progress["live_acknowledged_bytes"]) // 2
-                      if start_sample is None else int(start_sample))
-            next_seq = (int(progress["live_next_seq"])
-                        if start_seq is None else int(start_seq))
+            cursor = int(progress["live_acknowledged_bytes"]) // 2
             runtime = DeviceLiveRuntime(
-                asr=FunASRClient(), next_seq=next_seq,
+                asr=FunASRClient(), next_seq=int(progress["live_next_seq"]),
                 next_sample=cursor, segment_start_sample=cursor,
                 source_language=str(session["source_language"] or "auto"),
                 target_language=self._translation_target(session["target_language"]),
@@ -553,8 +452,6 @@ class DeviceService:
                 logger.exception("device_live_asr_start_failed session=%s; offline fallback active",
                                  session_id)
                 self._live_disabled.add(session_id)
-                self._clear_live_partial(session_id, reason="asr_start_error",
-                                         force_revision=True)
                 with suppress(BaseException):
                     await runtime.asr.close()
                 return None
@@ -563,124 +460,29 @@ class DeviceService:
                         session_id, runtime.next_seq, runtime.next_sample)
             return runtime
 
-    def _store_live_partial(self, session_id: str, *, text: str, start_sample: int,
-                            end_sample: int) -> int:
-        text = partial_caption_text(text)
-        if not text:
-            return self._clear_live_partial(session_id, reason="empty_partial")
-        start_ms = max(0, start_sample * 1000 // 16000)
-        end_ms = max(start_ms, end_sample * 1000 // 16000)
-        now = iso_now()
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT display_revision,partial_caption FROM device_sessions"
-                " WHERE server_session_id=?", (session_id,)).fetchone()
-            if row is None:
-                raise RuntimeError(f"device session disappeared: {session_id}")
-            if str(row["partial_caption"] or "") == text:
-                conn.execute(
-                    "UPDATE device_sessions SET partial_start_ms=?,partial_end_ms=?,"
-                    "partial_updated_at=?,updated_at=? WHERE server_session_id=?",
-                    (start_ms, end_ms, now, now, session_id))
-                return int(row["display_revision"])
-            display_revision = int(row["display_revision"]) + 1
-            conn.execute(
-                "UPDATE device_sessions SET partial_caption=?,partial_start_ms=?,"
-                "partial_end_ms=?,partial_updated_at=?,display_revision=?,updated_at=?"
-                " WHERE server_session_id=?",
-                (text, start_ms, end_ms, now, display_revision, now, session_id))
-            self._insert_display_event(
-                conn, session_id, display_revision, kind="partial", text=text,
-                start_ms=start_ms, end_ms=end_ms, created_at=now)
-        logger.info("device_live_partial session=%s display_revision=%d chars=%d bytes=%d",
-                    session_id, display_revision, len(text), len(text.encode("utf-8")))
-        self._notify_live_partial(session_id, {
-            "active": True, "text": text, "start_ms": start_ms,
-            "end_ms": end_ms, "display_revision": display_revision,
-        })
-        return display_revision
-
-    def _clear_live_partial(self, session_id: str, *, reason: str,
-                            force_revision: bool = False) -> int:
-        now = iso_now()
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT display_revision,partial_caption FROM device_sessions"
-                " WHERE server_session_id=?", (session_id,)).fetchone()
-            if row is None:
-                return 0
-            active = bool(str(row["partial_caption"] or ""))
-            display_revision = int(row["display_revision"])
-            if not active and not force_revision:
-                return display_revision
-            display_revision += 1
-            conn.execute(
-                "UPDATE device_sessions SET partial_caption='',partial_start_ms=0,"
-                "partial_end_ms=0,partial_updated_at=NULL,display_revision=?,updated_at=?"
-                " WHERE server_session_id=?",
-                (display_revision, now, session_id))
-            self._insert_display_event(
-                conn, session_id, display_revision, kind="clear", created_at=now)
-        logger.info("device_live_partial_cleared session=%s display_revision=%d reason=%s",
-                    session_id, display_revision, reason)
-        self._notify_live_partial(session_id, {
-            "active": False, "text": "", "start_ms": 0, "end_ms": 0,
-            "display_revision": display_revision, "reason": reason,
-        })
-        return display_revision
-
-    def _expire_live_partial(self, session: Any) -> Any:
-        text = str(session["partial_caption"] or "")
-        updated = session["partial_updated_at"]
-        if not text or not updated:
-            return session
-        try:
-            age = (utcnow() - datetime.fromisoformat(
-                str(updated).replace("Z", "+00:00")).astimezone(timezone.utc)).total_seconds()
-        except ValueError:
-            age = PARTIAL_CAPTION_TTL_SECONDS + 1
-        if age > PARTIAL_CAPTION_TTL_SECONDS:
-            self._clear_live_partial(str(session["server_session_id"]),
-                                     reason="expired", force_revision=True)
-            return self.db.query_one(
-                "SELECT * FROM device_sessions WHERE server_session_id=?",
-                (session["server_session_id"],))
-        return session
-
     def _store_live_caption(self, session_id: str, *, text: str, start_sample: int,
                             end_sample: int) -> tuple[str, int]:
         seg_id = "lyseg-" + uuid.uuid4().hex
         now = iso_now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT revision,display_revision FROM device_sessions"
-                " WHERE server_session_id=?",
+                "SELECT revision FROM device_sessions WHERE server_session_id=?",
                 (session_id,)).fetchone()
             if row is None:
                 raise RuntimeError(f"device session disappeared: {session_id}")
             revision = int(row["revision"]) + 1
-            display_revision = int(row["display_revision"]) + 1
             conn.execute(
                 "INSERT INTO segments(session_id,seg_id,ord,start_ms,end_ms,text,speaker_id,"
-                "speaker_label,speaker_final,source,state,revision,caption_revision)"
+                "speaker_label,speaker_final,source,state,revision)"
                 " VALUES(?,?,(SELECT COALESCE(MAX(ord),0)+1 FROM segments WHERE session_id=?),"
-                "?,?,?,NULL,NULL,0,'live','provisional',?,?)",
+                "?,?,?,NULL,NULL,0,'live','provisional',?)",
                 (session_id, seg_id, session_id, start_sample * 1000 // 16000,
-                 end_sample * 1000 // 16000, text, revision, revision))
+                 end_sample * 1000 // 16000, text, revision))
             conn.execute(
-                "UPDATE device_sessions SET revision=?,caption_revision=?,display_revision=?,partial_caption='',"
-                "partial_start_ms=0,partial_end_ms=0,partial_updated_at=NULL,updated_at=?"
-                " WHERE server_session_id=?",
-                (revision, revision, display_revision, now, session_id))
+                "UPDATE device_sessions SET revision=?,updated_at=? WHERE server_session_id=?",
+                (revision, now, session_id))
             conn.execute("UPDATE meetings SET updated_at=? WHERE session_id=?",
                          (now, session_id))
-            self._insert_display_event(
-                conn, session_id, display_revision, kind="final", text=text,
-                start_ms=start_sample * 1000 // 16000,
-                end_ms=end_sample * 1000 // 16000, seg_id=seg_id,
-                caption_revision=revision, created_at=now)
-        logger.info("device_live_final session=%s revision=%d display_revision=%d",
-                    session_id, revision, display_revision)
         return seg_id, revision
 
     def _store_live_translation(self, session_id: str, seg_id: str, text: str) -> int:
@@ -696,13 +498,11 @@ class DeviceService:
                 raise RuntimeError(f"device caption disappeared: {session_id}/{seg_id}")
             revision = int(row["revision"]) + 1
             conn.execute(
-                "UPDATE segments SET translation=?,revision=?,translation_revision=?"
-                " WHERE session_id=? AND seg_id=?",
-                (text, revision, revision, session_id, seg_id))
+                "UPDATE segments SET translation=?,revision=? WHERE session_id=? AND seg_id=?",
+                (text, revision, session_id, seg_id))
             conn.execute(
-                "UPDATE device_sessions SET revision=?,translation_revision=?,updated_at=?"
-                " WHERE server_session_id=?",
-                (revision, revision, now, session_id))
+                "UPDATE device_sessions SET revision=?,updated_at=? WHERE server_session_id=?",
+                (revision, now, session_id))
             conn.execute("UPDATE meetings SET updated_at=? WHERE session_id=?",
                          (now, session_id))
         return revision
@@ -722,14 +522,12 @@ class DeviceService:
                 raise RuntimeError(f"device caption disappeared: {session_id}/{seg_id}")
             revision = int(row["revision"]) + 1
             conn.execute(
-                "UPDATE segments SET speaker_id=?,speaker_label=?,speaker_final=0,revision=?,"
-                "speaker_revision=?"
+                "UPDATE segments SET speaker_id=?,speaker_label=?,speaker_final=0,revision=?"
                 " WHERE session_id=? AND seg_id=?",
-                (speaker_id, speaker_label, revision, revision, session_id, seg_id))
+                (speaker_id, speaker_label, revision, session_id, seg_id))
             conn.execute(
-                "UPDATE device_sessions SET revision=?,speaker_revision=?,updated_at=?"
-                " WHERE server_session_id=?",
-                (revision, revision, now, session_id))
+                "UPDATE device_sessions SET revision=?,updated_at=? WHERE server_session_id=?",
+                (revision, now, session_id))
             conn.execute("UPDATE meetings SET updated_at=? WHERE session_id=?",
                          (now, session_id))
         return revision
@@ -759,7 +557,6 @@ class DeviceService:
             "speaker_state": decision.state,
             "speaker_confidence": round(decision.confidence, 4),
             "revision": revision, "language": runtime.source_language,
-            "update_kind": "speaker",
         })
 
     def _queue_live_speaker(self, session_id: str, runtime: DeviceLiveRuntime,
@@ -806,72 +603,40 @@ class DeviceService:
 
     async def _persist_live_results(self, session_id: str, runtime: DeviceLiveRuntime,
                                     results: list[dict[str, Any]], end_sample: int) -> None:
-        unique_finals = [partial_caption_text(item.get("text")).strip()
-                         for item in results if item.get("is_final")]
-        unique_finals = [text for text in unique_finals if text and text != runtime.last_final_text]
-        batch_final_start = min(runtime.segment_start_sample, end_sample)
-        batch_final_span = max(0, end_sample - batch_final_start)
-        final_index = 0
-        pending_partial: str | None = None
-
-        def flush_partial() -> None:
-            nonlocal pending_partial
-            if pending_partial:
-                self._store_live_partial(
-                    session_id, text=pending_partial,
-                    start_sample=min(runtime.segment_start_sample, end_sample),
-                    end_sample=end_sample)
-            pending_partial = None
-
+        finals: list[str] = []
         for result in results:
-            text = partial_caption_text(result.get("text")).strip()
-            if not text:
-                continue
-            if result.get("is_final"):
-                # Preserve wire order.  A FunASR drain can contain the prior
-                # utterance final followed by fragments of the next one; the
-                # V1.0.0 collect-then-final pass cleared that new partial.
-                flush_partial()
-                if text == runtime.last_final_text:
-                    self._clear_live_partial(session_id, reason="duplicate_final")
-                    continue
-                divisor = max(1, len(unique_finals))
-                seg_start = batch_final_start + batch_final_span * final_index // divisor
-                final_index += 1
-                seg_end = batch_final_start + batch_final_span * final_index // divisor
-                seg_start = max(runtime.segment_start_sample, seg_start)
-                seg_end = max(seg_start, seg_end)
-                seg_id, revision = self._store_live_caption(
-                    session_id, text=text, start_sample=seg_start, end_sample=seg_end)
-                runtime.last_final_text = text
-                runtime.segment_start_sample = seg_end
-                logger.info("device_live_caption session=%s seg=%s revision=%d samples=%d..%d",
-                            session_id, seg_id, revision, seg_start, seg_end)
-                self._notify_live_caption(session_id, {
-                    "seg_id": seg_id,
-                    "text": text,
-                    "start_ms": seg_start * 1000 // 16000,
-                    "end_ms": seg_end * 1000 // 16000,
-                    "speaker_id": None,
-                    "speaker_label": None,
-                    "revision": revision,
-                    "language": runtime.source_language,
-                    "update_kind": "caption",
-                })
-                pcm_start = max(0, seg_start - runtime.speaker_pcm_start_sample) * 2
-                pcm_end = max(0, seg_end - runtime.speaker_pcm_start_sample) * 2
-                self._queue_live_speaker(session_id, runtime, seg_id, text,
-                                         seg_start, seg_end,
-                                         bytes(runtime.speaker_pcm[pcm_start:pcm_end]))
-                await self._translate_live_caption(session_id, runtime, seg_id, text)
-                continue
-
-            # The engine adapter supplies an utterance-wide cumulative value;
-            # mocked/legacy clients fall back to their raw non-final text.
-            pending_partial = partial_caption_text(
-                result.get("partial_text") or result.get("text")).strip()
-
-        flush_partial()
+            text = str(result.get("text") or "").strip()
+            if result.get("is_final") and text and text != runtime.last_final_text:
+                finals.append(text)
+        if not finals:
+            return
+        start = min(runtime.segment_start_sample, end_sample)
+        span = max(0, end_sample - start)
+        for index, text in enumerate(finals):
+            seg_start = start + span * index // len(finals)
+            seg_end = start + span * (index + 1) // len(finals)
+            seg_id, revision = self._store_live_caption(
+                session_id, text=text, start_sample=seg_start, end_sample=seg_end)
+            runtime.last_final_text = text
+            runtime.segment_start_sample = seg_end
+            logger.info("device_live_caption session=%s seg=%s revision=%d samples=%d..%d",
+                        session_id, seg_id, revision, seg_start, seg_end)
+            self._notify_live_caption(session_id, {
+                "seg_id": seg_id,
+                "text": text,
+                "start_ms": seg_start * 1000 // 16000,
+                "end_ms": seg_end * 1000 // 16000,
+                "speaker_id": None,
+                "speaker_label": None,
+                "revision": revision,
+                "language": runtime.source_language,
+            })
+            pcm_start = max(0, seg_start - runtime.speaker_pcm_start_sample) * 2
+            pcm_end = max(0, seg_end - runtime.speaker_pcm_start_sample) * 2
+            self._queue_live_speaker(session_id, runtime, seg_id, text,
+                                     seg_start, seg_end,
+                                     bytes(runtime.speaker_pcm[pcm_start:pcm_end]))
+            await self._translate_live_caption(session_id, runtime, seg_id, text)
         consumed = max(0, runtime.segment_start_sample - runtime.speaker_pcm_start_sample) * 2
         if consumed:
             del runtime.speaker_pcm[:consumed]
@@ -903,18 +668,14 @@ class DeviceService:
                         trim -= trim % 2
                         del runtime.speaker_pcm[:trim]
                         runtime.speaker_pcm_start_sample += trim // 2
-                started = time.monotonic()
                 results = await asyncio.wait_for(
                     runtime.asr.send_audio(data), timeout=LIVE_ASR_SEND_TIMEOUT_SECONDS)
-                results.extend(await runtime.asr.collect_results(LIVE_RESULT_WAIT_SECONDS))
             except Exception:
                 # The send outcome may be ambiguous.  Never replay it into the
                 # same or a new live recognizer; the durable offline pass is the
                 # exactly-once recovery authority.
                 logger.exception("device_live_asr_failed session=%s seq=%d; offline fallback active",
                                  session_id, runtime.next_seq)
-                self._clear_live_partial(session_id, reason="asr_error",
-                                         force_revision=True)
                 self._live_disabled.add(session_id)
                 self._live.pop(session_id, None)
                 with suppress(BaseException):
@@ -927,10 +688,6 @@ class DeviceService:
             runtime.next_sample = end_sample
             try:
                 await self._persist_live_results(session_id, runtime, results, end_sample)
-                if results:
-                    logger.info("device_live_result session=%s seq=%d results=%d latency_ms=%d",
-                                session_id, runtime.next_seq - 1, len(results),
-                                int((time.monotonic() - started) * 1000))
             except Exception:
                 logger.exception("device_live_result_persist_failed session=%s seq=%d",
                                  session_id, runtime.next_seq - 1)
@@ -941,69 +698,9 @@ class DeviceService:
         async with runtime.lock:
             await self._feed_live_locked(session_id, runtime)
 
-    async def _run_live_feed(self, session_id: str, start_seq: int,
-                             start_sample: int) -> None:
-        try:
-            session = self.db.query_one(
-                "SELECT * FROM device_sessions WHERE server_session_id=?", (session_id,))
-            if session is None or session["status"] != "uploading":
-                return
-            runtime = await self._ensure_live_runtime(
-                session, start_seq=start_seq, start_sample=start_sample)
-            await self._feed_live(session_id, runtime)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("device_live_worker_failed session=%s", session_id)
-            self._clear_live_partial(session_id, reason="worker_error",
-                                     force_revision=True)
-        finally:
-            current = asyncio.current_task()
-            if self._live_feed_tasks.get(session_id) is current:
-                self._live_feed_tasks.pop(session_id, None)
-            pending = self._live_feed_pending.pop(session_id, None)
-            if pending is not None:
-                self._schedule_live_feed(
-                    session_id, start_seq=pending[0], start_sample=pending[1])
-
-    def _schedule_live_feed(self, session_id: str, *, start_seq: int,
-                            start_sample: int) -> None:
-        task = self._live_feed_tasks.get(session_id)
-        if task is not None and not task.done():
-            # Close the drain/exit race: the active worker may just have
-            # observed no next row while this request commits a new one.  Its
-            # finally block will consume this marker and start one more drain.
-            self._live_feed_pending[session_id] = (start_seq, start_sample)
-            return
-        task = asyncio.create_task(
-            self._run_live_feed(session_id, start_seq, start_sample),
-            name=f"device-live-{session_id}")
-        self._live_feed_tasks[session_id] = task
-
-        def done(completed: asyncio.Task) -> None:
-            if completed.cancelled():
-                return
-            error = completed.exception()
-            if error is not None:
-                logger.error("device_live_worker_task_failed session=%s error=%s",
-                             session_id, error, exc_info=error)
-
-        task.add_done_callback(done)
-
-    async def _wait_live_feed(self, session_id: str) -> None:
-        while True:
-            task = self._live_feed_tasks.get(session_id)
-            if task is None or task is asyncio.current_task():
-                return
-            with suppress(asyncio.CancelledError):
-                await task
-
     async def _finish_live(self, session_id: str, end_sample: int) -> None:
-        await self._wait_live_feed(session_id)
         runtime = self._live.get(session_id)
         if runtime is None:
-            self._clear_live_partial(session_id, reason="session_stop",
-                                     force_revision=True)
             return
         async with runtime.lock:
             try:
@@ -1019,48 +716,23 @@ class DeviceService:
             finally:
                 self._live.pop(session_id, None)
                 self._live_init_locks.pop(session_id, None)
-                self._clear_live_partial(session_id, reason="session_stop",
-                                         force_revision=True)
                 with suppress(BaseException):
                     await runtime.asr.close()
 
     async def _abort_live(self, session_id: str) -> None:
-        self._live_feed_pending.pop(session_id, None)
-        task = self._live_feed_tasks.pop(session_id, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
         runtime = self._live.pop(session_id, None)
         self._live_init_locks.pop(session_id, None)
         self._live_disabled.add(session_id)
         if runtime is not None:
             with suppress(BaseException):
                 await runtime.asr.close()
-        self._clear_live_partial(session_id, reason="session_abort",
-                                 force_revision=True)
 
     async def _rotate_live(self, session_id: str) -> None:
         """Close one streaming recognizer without disabling later epochs."""
         runtime = self._live.get(session_id)
         if runtime is not None:
             await self._finish_live(session_id, runtime.next_sample)
-        else:
-            self._clear_live_partial(session_id, reason="epoch_rotate",
-                                     force_revision=True)
         self._live_disabled.discard(session_id)
-
-    async def shutdown(self) -> None:
-        """Stop transient workers; durable audio remains the recovery authority."""
-        session_ids = set(self._live_feed_tasks) | set(self._live)
-        for session_id in session_ids:
-            await self._abort_live(session_id)
-        callbacks = tuple(self._callback_tasks)
-        for task in callbacks:
-            task.cancel()
-        if callbacks:
-            await asyncio.gather(*callbacks, return_exceptions=True)
-        self._callback_locks.clear()
 
     def digest_code(self, code: str) -> str:
         return hmac.new(self._secret, f"pair-code:{code}".encode(), hashlib.sha256).hexdigest()
@@ -2004,12 +1676,9 @@ class DeviceService:
             (server_session_id, start_sample + sample_count, start_sample))
         if overlap:
             raise api_error(409, "AUDIO_RANGE_OVERLAP", "音频分片采样范围重叠")
-        # Capture the durable cursor before inserting this request.  The
-        # background worker starts here, so a process restart never replays
-        # already acknowledged chunks into a fresh recognizer.
-        live_cursor = self._live_progress(server_session_id)
-        worker_start_seq = int(live_cursor["live_next_seq"])
-        worker_start_sample = int(live_cursor["live_acknowledged_bytes"]) // 2
+        # Capture the durable cursor before inserting this request.  This is
+        # what prevents replaying old chunks after a process restart.
+        runtime = await self._ensure_live_runtime(session)
         directory = self.chunk_root / server_session_id
         directory.mkdir(parents=True, exist_ok=True)
         # 每个并发上传使用独立终文件；DB 唯一约束败的请求只删自己的文件，
@@ -2030,12 +1699,7 @@ class DeviceService:
             path.unlink(missing_ok=True)
             return await self.upload_chunk(server_session_id, seq, data, content_sha256,
                                            byte_offset, byte_count, principal)
-        # ACK durability is only file fsync + SQLite commit.  FunASR startup,
-        # network I/O, partial captions, speaker analysis and translation are
-        # intentionally outside this HTTP request.
-        self._schedule_live_feed(
-            server_session_id, start_seq=worker_start_seq,
-            start_sample=worker_start_sample)
+        await self._feed_live(server_session_id, runtime)
         return {"accepted": True, "duplicate": False, "seq": seq,
                 **self._upload_ack(server_session_id)}
 
@@ -2092,10 +1756,9 @@ class DeviceService:
                         gap_start // 2 * 1000 // 16000,
                         body.resume_offset_bytes // 2 * 1000 // 16000)
             self._live_disabled.discard(server_session_id)
+            session = self._session(principal, server_session_id)
+            await self._ensure_live_runtime(session)
             ack = self._upload_ack(server_session_id)
-            self._schedule_live_feed(
-                server_session_id, start_seq=int(ack["live_next_seq"]),
-                start_sample=int(ack["live_acknowledged_bytes"]) // 2)
         response = {
             "server_session_id": server_session_id,
             "resumed": True,
@@ -2555,25 +2218,13 @@ class DeviceService:
         return response
 
     def session_state(self, server_session_id: str, principal: DevicePrincipal,
-                      after_revision: int, *, include_partial: bool = False,
-                      after_display_revision: int = 0,
-                      after_caption_revision: int | None = None,
-                      after_speaker_revision: int | None = None,
-                      after_translation_revision: int | None = None,
-                      after_summary_revision: int | None = None,
-                      include_display_events: bool = False) -> dict[str, Any]:
+                      after_revision: int) -> dict[str, Any]:
         session = self._session(principal, server_session_id)
-        session = self._expire_live_partial(session)
         meeting_state = self.storage.get_state(server_session_id)
         if meeting_state == "done" and session["status"] not in {"done", "failed"}:
-            self._clear_live_partial(server_session_id, reason="session_done",
-                                     force_revision=True)
-            self.db.execute(
-                "UPDATE device_sessions SET status='done',revision=revision+1,"
-                "partial_caption='',partial_start_ms=0,partial_end_ms=0,"
-                "partial_updated_at=NULL,updated_at=?"
-                " WHERE server_session_id=? AND status!='done'",
-                (iso_now(), server_session_id))
+            self.db.execute("UPDATE device_sessions SET status='done',revision=revision+1,updated_at=?"
+                            " WHERE server_session_id=? AND status!='done'",
+                            (iso_now(), server_session_id))
             session = self._session(principal, server_session_id)
         progress = self._upload_ack(server_session_id)
         expected_chunks = session["expected_chunks"]
@@ -2585,53 +2236,25 @@ class DeviceService:
             missing_all, missing_count = self._missing_sequences(present, int(expected_chunks))
         missing = missing_all
         revision = int(session["revision"])
-        revision_changed = revision > max(0, after_revision)
-        display_revision = int(session["display_revision"])
-        display_changed = ((include_partial or include_display_events) and
-                           display_revision > max(0, after_display_revision))
-        caption_revision = int(session["caption_revision"])
-        speaker_revision = int(session["speaker_revision"])
-        translation_revision = int(session["translation_revision"])
-        summary_revision = int(session["summary_revision"])
-        channel_mode = any(value is not None for value in (
-            after_caption_revision, after_speaker_revision,
-            after_translation_revision, after_summary_revision)) or include_display_events
-        caption_cursor = max(0, (after_caption_revision
-                                if after_caption_revision is not None else after_revision))
-        speaker_cursor = max(0, after_speaker_revision or 0)
-        translation_cursor = max(0, after_translation_revision or 0)
-        summary_cursor = max(0, after_summary_revision or 0)
-        caption_changed = caption_revision > caption_cursor
-        speaker_changed = channel_mode and speaker_revision > speaker_cursor
-        translation_changed = channel_mode and translation_revision > translation_cursor
-        summary_changed = channel_mode and summary_revision > summary_cursor
-        changed = ((revision_changed or caption_changed or speaker_changed or
-                    translation_changed or summary_changed or display_changed) if channel_mode
-                   else revision_changed or display_changed)
-        all_segments = self.storage.load_segments(server_session_id)
-        segments = ([seg for seg in all_segments
-                     if int(seg.get("caption_revision") or 0) > caption_cursor][-16:]
-                    if caption_changed else [])
+        changed = revision > max(0, after_revision)
+        segments = ([seg for seg in self.storage.load_segments(server_session_id)
+                     if int(seg.get("revision") or 0) > max(0, after_revision)][-16:]
+                    if changed else [])
         captions = [{
             "seg_id": device_text(seg["seg_id"], 63),
             "start_ms": int(seg.get("start_ms") or 0),
-            "end_ms": int(seg.get("end_ms") or 0), "text": device_text(seg.get("text"), 512),
+            "end_ms": int(seg.get("end_ms") or 0), "text": device_text(seg.get("text"), 255),
             "speaker_label": device_text(seg.get("speaker_label"), 63) or None,
-            "revision": int(seg.get("caption_revision") or seg.get("revision") or revision),
-            "caption_revision": int(seg.get("caption_revision") or 0),
-            "operation": "upsert",
+            "revision": int(seg.get("revision") or revision),
         } for seg in segments if seg.get("text")]
-        translation_segments = ([seg for seg in all_segments
-                                 if int(seg.get("translation_revision") or 0) > translation_cursor]
-                                if channel_mode and translation_changed else segments)
         translations = [{
             "seg_id": device_text(seg["seg_id"], 63),
-            "source_text": device_text(seg.get("text"), 512),
-            "translated_text": device_text(seg.get("translation"), 512),
+            "source_text": device_text(seg.get("text"), 255),
+            "translated_text": device_text(seg.get("translation"), 383),
             "source_language": device_text(session["source_language"] or "auto", 15),
             "target_language": device_text(session["target_language"] or "", 15),
-            "revision": int(seg.get("translation_revision") or seg.get("revision") or revision),
-        } for seg in translation_segments if seg.get("translation")]
+            "revision": int(seg.get("revision") or revision),
+        } for seg in segments if seg.get("translation")]
         marks = [{"id": row["client_mark_id"],
                   "at_ms": int(row["offset_samples"]) * 1000 // 16000,
                   "kind": row["kind"], "label": row["label"]}
@@ -2665,44 +2288,6 @@ class DeviceService:
             "SELECT speaker_id,COUNT(*) AS n FROM segments WHERE session_id=?"
             " AND speaker_id IS NOT NULL GROUP BY speaker_id ORDER BY speaker_id",
             (server_session_id,))
-        speaker_updates = []
-        if channel_mode and speaker_changed:
-            speaker_updates = [{
-                "operation": "upsert",
-                "seg_id": device_text(seg["seg_id"], 63),
-                "speaker_id": device_text(seg.get("speaker_id"), 31) or None,
-                "speaker_label": device_text(seg.get("speaker_label"), 63) or None,
-                "speaker_revision": int(seg.get("speaker_revision") or 0),
-            } for seg in all_segments
-                if int(seg.get("speaker_revision") or 0) > speaker_cursor]
-
-        display_events: list[dict[str, Any]] = []
-        display_events_through = max(0, after_display_revision)
-        display_events_truncated = False
-        if include_display_events:
-            event_rows = self.db.query(
-                "SELECT display_revision,kind,text,start_ms,end_ms,seg_id,caption_revision"
-                " FROM device_display_events WHERE server_session_id=? AND display_revision>?"
-                " ORDER BY display_revision LIMIT 4",
-                (server_session_id, max(0, after_display_revision)))
-            if event_rows:
-                first_event_revision = int(event_rows[0]["display_revision"])
-                display_events_truncated = first_event_revision > max(0, after_display_revision) + 1
-                display_events_through = int(event_rows[-1]["display_revision"])
-            display_events = [{
-                "display_revision": int(row["display_revision"]),
-                "kind": str(row["kind"]),
-                "text": partial_caption_text(row["text"]),
-                "start_ms": int(row["start_ms"] or 0),
-                "end_ms": int(row["end_ms"] or 0),
-                "seg_id": device_text(row["seg_id"], 63) or None,
-                "caption_revision": int(row["caption_revision"] or 0),
-            } for row in event_rows]
-            if after_display_revision > 0:
-                self.db.execute(
-                    "DELETE FROM device_display_events WHERE server_session_id=?"
-                    " AND display_revision<=?",
-                    (server_session_id, after_display_revision))
         response = {
             "changed": changed,
             "client_session_id": session["client_session_id"],
@@ -2732,39 +2317,6 @@ class DeviceService:
                        "message": device_text(session["failure_message"], 191)}
                       if session["status"] == "failed" else None),
         }
-        if channel_mode:
-            response.update({
-                "caption_revision": caption_revision,
-                "speaker_revision": speaker_revision,
-                "translation_revision": translation_revision,
-                "summary_revision": summary_revision,
-                "caption_changed": caption_changed,
-                "speaker_changed": speaker_changed,
-                "translation_changed": translation_changed,
-                "summary_changed": summary_changed,
-                "caption_updates": captions,
-                "speaker_updates": speaker_updates,
-                "translation_updates": translations,
-            })
-        if include_partial or include_display_events:
-            partial = partial_caption_text(session["partial_caption"])
-            response.update({
-                "display_revision": display_revision,
-                "display_changed": display_changed,
-                "partial": {
-                    "active": bool(partial),
-                    "text": partial,
-                    "start_ms": int(session["partial_start_ms"] or 0),
-                    "end_ms": int(session["partial_end_ms"] or 0),
-                },
-            })
-        if include_display_events:
-            response.update({
-                "display_events": display_events,
-                "display_events_through_revision": display_events_through,
-                "display_events_pending": display_revision > display_events_through,
-                "display_events_truncated": display_events_truncated,
-            })
         while len(json.dumps(response, ensure_ascii=False,
                              separators=(",", ":")).encode("utf-8")) > 8191:
             if captions:
@@ -2776,8 +2328,6 @@ class DeviceService:
                                    if item["seg_id"] != oldest]
             elif translations:
                 translations.pop(0)
-            elif speaker_updates:
-                speaker_updates.pop(0)
             elif missing:
                 missing.pop()
             else:
@@ -3113,21 +2663,19 @@ def create_device_v2_router(storage: Any, *,
                             on_audio_range_committed: Callable[[str], Awaitable[None]] | None = None,
                             offline_progress: Callable[[str], dict[str, Any]] | None = None,
                             on_live_caption: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
-                            on_live_partial: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
                             on_mark: Callable[[str], Awaitable[None]] | None = None
                             ) -> APIRouter:
     router = APIRouter(prefix="/api/v2", tags=["luoye-device-v2"])
     service = DeviceService(storage, on_session_complete=on_session_complete,
                             on_audio_range_committed=on_audio_range_committed,
                             offline_progress=offline_progress,
-                            on_live_caption=on_live_caption,
-                            on_live_partial=on_live_partial, on_mark=on_mark)
+                            on_live_caption=on_live_caption, on_mark=on_mark)
 
     @router.get("/build-info")
     async def build_info():
         return {
             "product": "ClearMeeting",
-            "server_version": "1.0.1",
+            "server_version": "0.21.0",
             "server_release": SERVER_RELEASE,
             "api_contract": API_CONTRACT,
             "protocol_version": API_CONTRACT,
@@ -3140,13 +2688,12 @@ def create_device_v2_router(storage: Any, *,
                              "range_repair", "streaming_request_body",
                              "session_cancel", "live_epoch_resume",
                              "manual_gap_repair", "independent_sd_delete",
-                             "device_rolling_minutes", "timeline_marks",
+                             "transcript_only_live_v1", "template_minutes_v1",
+                             "editable_meeting_speakers_v1", "meeting_memory_v1",
+                             "on_demand_minutes_v1", "timeline_marks",
                              "semantic_timeline_v2", "semantic_timeline_v3_anchored", "per_device_speaker_diarization",
                              "speaker_backend_readiness", "offline_asr_pipeline_v1",
-                             "device_live_partial_caption_v1",
-                             "device_live_partial_caption_v2",
-                             "device_caption_upsert_v1",
-                             "device_revision_channels_v1"],
+                             "canonical_offline_diarization_v2"],
             "server_time": iso_now(),
         }
 
@@ -3309,23 +2856,8 @@ def create_device_v2_router(storage: Any, *,
 
     @router.get("/device/sessions/{server_session_id}/state")
     async def session_state(server_session_id: str, after_revision: int = Query(default=0, ge=0),
-                            include_partial: bool = Query(default=False),
-                            after_display_revision: int = Query(default=0, ge=0),
-                            after_caption_revision: int | None = Query(default=None, ge=0),
-                            after_speaker_revision: int | None = Query(default=None, ge=0),
-                            after_translation_revision: int | None = Query(default=None, ge=0),
-                            after_summary_revision: int | None = Query(default=None, ge=0),
-                            include_display_events: bool = Query(default=False),
                             principal: DevicePrincipal = Depends(service.require_device)):
-        return service.session_state(
-            server_session_id, principal, after_revision,
-            include_partial=include_partial,
-            after_display_revision=after_display_revision,
-            after_caption_revision=after_caption_revision,
-            after_speaker_revision=after_speaker_revision,
-            after_translation_revision=after_translation_revision,
-            after_summary_revision=after_summary_revision,
-            include_display_events=include_display_events)
+        return service.session_state(server_session_id, principal, after_revision)
 
     @router.get("/device/agenda")
     async def agenda(after_revision: int = Query(default=0, ge=0),

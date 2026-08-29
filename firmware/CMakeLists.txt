@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 # Luoye firmware release identity. PROJECT_VER is the only firmware-version
 # source; the UI and startup log read the ESP app descriptor generated from it.
-set(PROJECT_VER "2.3.2")
+set(PROJECT_VER "1.7.0")
 set(LUOYE_PRODUCT_NAME "Luoye" CACHE STRING "Internal product name")
 set(LUOYE_PRODUCT_NAME_ZH "落叶" CACHE STRING "Internal product name (Chinese)")
 set(LUOYE_HARDWARE_REV "LY-HW-ENG-20260710" CACHE STRING "Target PCB revision")
@@ -13,8 +13,8 @@ set(LUOYE_DEVICE_AUTH_PROFILE "engineering" CACHE STRING
 # Protocol compatibility is release identity, not a reusable build-cache knob.
 # Keep these normal variables so an older build directory cannot silently
 # stamp stale server/client versions into a new firmware package.
-set(LUOYE_SERVER_RELEASE "1.0.1")
-set(LUOYE_MIN_CLIENT_VERSION "1.0.0")
+set(LUOYE_SERVER_RELEASE "0.21.0")
+set(LUOYE_MIN_CLIENT_VERSION "0.21.0")
 set(LUOYE_SERVER_BASE_URL "http://clearmeeting.chat:34567" CACHE STRING
     "ClearMeeting API origin without a trailing slash")
 option(LUOYE_ALLOW_INSECURE_HTTP
@@ -22,7 +22,7 @@ option(LUOYE_ALLOW_INSECURE_HTTP
 
 if(NOT LUOYE_DEVICE_AUTH_PROFILE STREQUAL "engineering")
   message(FATAL_ERROR
-    "Luoye 2.3.2 is frozen to device_auth_profile=engineering")
+    "Luoye 1.7.0 is frozen to device_auth_profile=engineering")
 endif()
 
 if(NOT LUOYE_SERVER_BASE_URL MATCHES "^https?://[A-Za-z0-9.-]+(:[0-9]+)?$")
@@ -58,7 +58,7 @@ if(Git_FOUND)
   endif()
 
   execute_process(
-    COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no
+    COMMAND "${GIT_EXECUTABLE}" status --porcelain
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
     OUTPUT_VARIABLE LUOYE_GIT_STATUS
     OUTPUT_STRIP_TRAILING_WHITESPACE

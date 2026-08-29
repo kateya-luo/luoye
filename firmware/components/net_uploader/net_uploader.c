@@ -17,6 +17,7 @@
 #include "luoye_build_info.h"
 #include "luoye_net_config.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,20 +52,15 @@ static const char *TAG = "net";
 #define BUILD_INFO_PATH     "/api/v2/build-info"
 #define PAIR_START_PATH     "/api/v2/device/pair/start"
 #define PAIR_STATUS_PATH    "/api/v2/device/pair/status"
-#define LIVE_CHUNK_BYTES    (32U * 1024U)
-#define LEGACY_CHUNK_BYTES  (160U * 1024U)
+#define CHUNK_BYTES         (160U * 1024U)
 #define RANGE_BLOCK_BYTES   SD_UPLOAD_RANGE_BLOCK_BYTES
 #define RANGE_STREAM_BYTES  (16U * 1024U)
-#define HTTP_TX_BUFFER_BYTES (8U * 1024U)
+#define HTTP_TX_BUFFER_BYTES (16U * 1024U)
 #define PORTAL_MAX_BODY     512
 #define RESPONSE_BYTES      8192
 #define MARKS_BUFFER_BYTES   (16 * 1024)
-#define LIVE_POLL_MS         1000
-#define LIVE_UPLOAD_CHECK_MS  200
-#define LIVE_CHECKPOINT_CHUNKS 8U
-#define LIVE_CHECKPOINT_MS    8000
-#define LIVE_DIAG_MS          10000
-#define LIVE_CAPTION_UPDATES_MAX 16
+#define LIVE_POLL_MS         2000
+#define LIVE_POLL_DEADLINE_MS 4000
 #define AGENDA_POLL_MS      60000
 #define TODO_AUDIO_BYTES    (1024 * 1024)
 #define STORAGE_SYNC_MS     10000
@@ -85,27 +81,13 @@ typedef struct {
   uint8_t *todo_audio;
 } upload_task_buffers_t;
 
-typedef struct {
-  sd_upload_reader_t reader;
-  char session_id[SD_UPLOAD_SESSION_ID_BYTES];
-  uint32_t checkpoint_seq;
-  int64_t checkpoint_ms;
-  int64_t diag_ms;
-  uint64_t sd_read_us;
-  uint64_t sha_us;
-  uint64_t http_us;
-  uint64_t state_save_us;
-  uint32_t chunks;
-  uint32_t bytes;
-  uint32_t chunks_since_poll;
-  bool closed_checkpointed;
-} live_upload_runtime_t;
-
 static net_post_fn s_post;
 static volatile bool s_online;
 static volatile bool s_bound;
 static volatile bool s_cloud_ready;
 static volatile bool s_manual_sync;
+static volatile uint32_t s_manual_sync_request_revision;
+static bool s_storage_fault_notified;
 static volatile bool s_idle_suspended;
 static volatile bool s_idle_resuming;
 static volatile bool s_idle_agenda_maintenance;
@@ -136,7 +118,6 @@ static esp_timer_handle_t s_reconnect_timer;
 static SemaphoreHandle_t s_pair_lock;
 static SemaphoreHandle_t s_live_lock;
 static luoye_live_result_t s_live;
-static luoye_live_caption_cache_t s_live_captions;
 static TaskHandle_t s_time_task;
 static TaskHandle_t s_wifi_selector_task;
 static volatile bool s_use_lan_server;
@@ -158,7 +139,6 @@ static char s_bulk_delete_command[73];
 static uint32_t s_bulk_deleted_count;
 static uint64_t s_bulk_freed_bytes;
 static upload_task_buffers_t s_upload_buffers;
-static esp_http_client_handle_t s_cloud_client;
 static net_pairing_info_t s_pair;
 static void cloud_set_ready(bool ready);
 static void wifi_selector_notify(void);
@@ -286,6 +266,37 @@ static void bulk_wifi_ps_update(bool bulk_upload_active) {
              "LY|UPLOAD_WIFI_PS|state=restore_failed mode=%d result=%s retry=1",
              (int)s_bulk_saved_wifi_ps, esp_err_to_name(error));
   }
+}
+
+static void stop_for_storage_fault(const char *phase, esp_err_t error) {
+  bool manual_was_running = s_manual_sync;
+  s_manual_sync = false;
+  bulk_wifi_ps_update(false);
+  bool first_notification = !s_storage_fault_notified;
+  if (first_notification) {
+    s_storage_fault_notified = true;
+    ESP_LOGE(TAG,
+             "LY|SYNC|state=failed reason=storage_fault phase=%s esp=%s local_ack=unchanged",
+             phase ? phase : "unknown", esp_err_to_name(error));
+  }
+  /* Every explicit retry must leave the UI in FAILED, even though the root
+     storage-fault log and recording error notification are emitted once. */
+  if (manual_was_running && s_post) {
+    s_post(APP_EV_SYNC_CHANGE, APP_SYNC_FAILED);
+  }
+  if (first_notification && sd_session_is_open() && s_post) {
+    s_post(APP_EV_STORAGE_ERROR, APP_ERR_STORAGE_SYNC);
+  }
+}
+
+static void stop_manual_sync_scan_error(const char *phase, esp_err_t error) {
+  if (!s_manual_sync) return;
+  s_manual_sync = false;
+  bulk_wifi_ps_update(false);
+  if (s_post) s_post(APP_EV_SYNC_CHANGE, APP_SYNC_FAILED);
+  ESP_LOGE(TAG,
+           "LY|SYNC|state=failed reason=local_scan phase=%s esp=%s local_ack=unchanged",
+           phase ? phase : "unknown", esp_err_to_name(error));
 }
 
 bool net_can_idle(void) {
@@ -420,10 +431,16 @@ bool net_request_agenda_sync(void) {
 }
 
 bool net_request_manual_sync(void) {
-  if (!s_bound || s_binding_generation == 0) return false;
+  if (!s_bound || s_binding_generation == 0 || !storage_sd_mounted()) {
+    return false;
+  }
   s_manual_sync = true;
+  uint32_t revision = s_manual_sync_request_revision + 1U;
+  s_manual_sync_request_revision = revision ? revision : 1U;
   if (s_post) s_post(APP_EV_SYNC_CHANGE, APP_SYNC_RUNNING);
-  ESP_LOGI(TAG, "LY|SYNC|state=requested online=%d cloud=%d", s_online,
+  ESP_LOGI(TAG,
+           "LY|SYNC|state=requested revision=%lu action=rearm_upload_plan online=%d cloud=%d",
+           (unsigned long)s_manual_sync_request_revision, s_online,
            s_cloud_ready);
   return true;
 }
@@ -444,7 +461,6 @@ static void live_reset(const char *client_session_id) {
   if (!s_live_lock) return;
   xSemaphoreTake(s_live_lock, portMAX_DELAY);
   memset(&s_live, 0, sizeof(s_live));
-  luoye_live_caption_cache_init(&s_live_captions);
   if (client_session_id) {
     luoye_live_set_text(s_live.client_session_id,
                         sizeof(s_live.client_session_id), client_session_id);
@@ -1139,6 +1155,7 @@ static esp_err_t build_info_exchange(void) {
     "network_scheduler", "bulk_upload_10mib", "range_repair",
     "streaming_request_body", "session_cancel", "live_epoch_resume",
     "manual_gap_repair", "independent_sd_delete",
+    "transcript_only_live_v1", "canonical_offline_diarization_v2",
   };
   bool valid = cJSON_IsString(contract) &&
                strcmp(contract->valuestring, luoye_build_api_contract()) == 0 &&
@@ -1237,6 +1254,8 @@ static esp_err_t pair_start_exchange(void) {
   cJSON_AddItemToArray(capabilities, cJSON_CreateString("network_scheduler"));
   cJSON_AddItemToArray(capabilities, cJSON_CreateString("bulk_upload_10mib"));
   cJSON_AddItemToArray(capabilities, cJSON_CreateString("range_repair"));
+  cJSON_AddItemToArray(capabilities,
+                       cJSON_CreateString("transcript_only_live_v1"));
   char *body = cJSON_PrintUnformatted(request);
   cJSON_Delete(request);
   if (!body) return ESP_ERR_NO_MEM;
@@ -1426,41 +1445,19 @@ static esp_err_t cloud_request(esp_http_client_method_t method,
     return ESP_ERR_INVALID_ARG;
   }
   if (response) memset(response, 0, sizeof(*response));
-  if (!s_cloud_client) {
-    esp_http_client_config_t config = {
-      .url = url,
-      .method = method,
-      .timeout_ms = 20000,
-      .buffer_size = 2048,
-      .buffer_size_tx = HTTP_TX_BUFFER_BYTES,
-      .event_handler = pair_http_event,
-      .user_data = response,
-      .crt_bundle_attach = LUOYE_CFG_ALLOW_INSECURE_HTTP
-                             ? NULL : esp_crt_bundle_attach,
-      .keep_alive_enable = true,
-    };
-    s_cloud_client = esp_http_client_init(&config);
-    if (!s_cloud_client) return ESP_ERR_NO_MEM;
-  } else {
-    if (esp_http_client_set_url(s_cloud_client, url) != ESP_OK ||
-        esp_http_client_set_method(s_cloud_client, method) != ESP_OK ||
-        esp_http_client_set_user_data(s_cloud_client, response) != ESP_OK) {
-      esp_http_client_cleanup(s_cloud_client);
-      s_cloud_client = NULL;
-      return ESP_FAIL;
-    }
-  }
-  esp_http_client_handle_t client = s_cloud_client;
-  /* A reused handle retains headers.  Clear request-specific values before
-     configuring the next GET/POST/PUT on the same keep-alive connection. */
-  static const char *TRANSIENT_HEADERS[] = {
-    "Content-Type", "Idempotency-Key", "X-Byte-Offset",
-    "X-Byte-Count", "X-Content-SHA256",
+  esp_http_client_config_t config = {
+    .url = url,
+    .method = method,
+    .timeout_ms = 20000,
+    .buffer_size = 2048,
+    .buffer_size_tx = HTTP_TX_BUFFER_BYTES,
+    .event_handler = response ? pair_http_event : NULL,
+    .user_data = response,
+    .crt_bundle_attach = LUOYE_CFG_ALLOW_INSECURE_HTTP
+                           ? NULL : esp_crt_bundle_attach,
   };
-  for (size_t i = 0; i < sizeof(TRANSIENT_HEADERS) / sizeof(TRANSIENT_HEADERS[0]);
-       ++i) {
-    (void)esp_http_client_delete_header(client, TRANSIENT_HEADERS[i]);
-  }
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) return ESP_ERR_NO_MEM;
   if (content_type) esp_http_client_set_header(client, "Content-Type", content_type);
   esp_http_client_set_header(client, "X-Luoye-Protocol", luoye_build_api_contract());
   esp_http_client_set_header(client, "X-Luoye-Firmware", luoye_build_version());
@@ -1479,17 +1476,14 @@ static esp_err_t cloud_request(esp_http_client_method_t method,
   }
   if (sha256) esp_http_client_set_header(client, "X-Content-SHA256", sha256);
   set_authorization(client);
-  esp_http_client_set_post_field(client, body ? (const char *)body : "", body_size);
+  if (body || body_size) {
+    esp_http_client_set_post_field(client, body ? (const char *)body : "", body_size);
+  }
   esp_err_t error = esp_http_client_perform(client);
   int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
   if (error == ESP_OK && response && response->overflow) {
     error = ESP_ERR_INVALID_SIZE;
-  }
-  /* A transport failure may leave the reusable client in an indeterminate
-     state.  Dispose it here; the next retry creates a fresh connection. */
-  if (error != ESP_OK) {
-    esp_http_client_cleanup(s_cloud_client);
-    s_cloud_client = NULL;
   }
   if (http_status) *http_status = status;
   return error;
@@ -1497,6 +1491,10 @@ static esp_err_t cloud_request(esp_http_client_method_t method,
 
 static uint32_t retry_item(sd_upload_item_t *item, esp_err_t error,
                            int http_status, const char *phase) {
+  if (storage_sd_faulted()) {
+    stop_for_storage_fault(phase, error);
+    return 30000;
+  }
   luoye_upload_http_class_t classification =
       luoye_upload_classify_http(error == ESP_OK, http_status);
   item->last_http_status = http_status;
@@ -1542,6 +1540,13 @@ static uint32_t retry_item(sd_upload_item_t *item, esp_err_t error,
   return delay;
 }
 
+static void report_uploader_storage_errno(const char *source, int value) {
+  if (value == EIO || value == ENODEV || value == ENXIO ||
+      value == ETIMEDOUT) {
+    storage_sd_report_io_fault(source, ESP_FAIL, value);
+  }
+}
+
 static uint32_t save_stage(sd_upload_item_t *item, const char *state) {
   snprintf(item->state, sizeof(item->state), "%s", state);
   item->retry_count = 0;
@@ -1550,88 +1555,6 @@ static uint32_t save_stage(sd_upload_item_t *item, const char *state) {
     return retry_item(item, ESP_FAIL, 0, "persist");
   }
   return 0;
-}
-
-static void live_runtime_reset(live_upload_runtime_t *runtime) {
-  if (!runtime) return;
-  sd_upload_reader_close(&runtime->reader);
-  memset(runtime, 0, sizeof(*runtime));
-}
-
-static void live_runtime_begin(live_upload_runtime_t *runtime,
-                               const sd_upload_item_t *item) {
-  live_runtime_reset(runtime);
-  if (!item) return;
-  snprintf(runtime->session_id, sizeof(runtime->session_id), "%s",
-           item->session_id);
-  runtime->checkpoint_seq = item->next_seq;
-  runtime->checkpoint_ms = esp_timer_get_time() / 1000;
-  runtime->diag_ms = runtime->checkpoint_ms;
-}
-
-static uint32_t live_checkpoint(sd_upload_item_t *item,
-                                live_upload_runtime_t *runtime,
-                                bool force, const char *reason) {
-  if (!item || !runtime) return 0;
-  int64_t now_ms = esp_timer_get_time() / 1000;
-  uint32_t chunks = item->next_seq >= runtime->checkpoint_seq
-                      ? item->next_seq - runtime->checkpoint_seq
-                      : LIVE_CHECKPOINT_CHUNKS;
-  if (!force && chunks < LIVE_CHECKPOINT_CHUNKS &&
-      now_ms - runtime->checkpoint_ms < LIVE_CHECKPOINT_MS) {
-    return 0;
-  }
-  snprintf(item->state, sizeof(item->state), "uploading");
-  item->retry_count = 0;
-  item->last_http_status = 0;
-  int64_t started_us = esp_timer_get_time();
-  esp_err_t error = sd_upload_save(item);
-  runtime->state_save_us += (uint64_t)(esp_timer_get_time() - started_us);
-  if (error != ESP_OK) return retry_item(item, error, 0, "checkpoint");
-  runtime->checkpoint_seq = item->next_seq;
-  runtime->checkpoint_ms = now_ms;
-  ESP_LOGI(TAG,
-           "LY|LIVE_CHECKPOINT|id=%s seq=%lu acked=%lu reason=%s result=ESP_OK",
-           item->session_id, (unsigned long)item->next_seq,
-           (unsigned long)item->acknowledged_bytes,
-           reason ? reason : "interval");
-  return 0;
-}
-
-static uint32_t live_poll_interval_ms(uint32_t lag_bytes) {
-  if (lag_bytes > 5U * 32000U) return 3000;
-  if (lag_bytes > 2U * 32000U) return 2000;
-  return LIVE_POLL_MS;
-}
-
-static void live_diag_maybe(sd_upload_item_t *item,
-                            live_upload_runtime_t *runtime) {
-  if (!item || !runtime) return;
-  int64_t now_ms = esp_timer_get_time() / 1000;
-  if (now_ms - runtime->diag_ms < LIVE_DIAG_MS) return;
-  uint32_t lag_bytes = item->pcm_bytes - item->acknowledged_bytes;
-  uint32_t lag_ms = (uint32_t)(((uint64_t)lag_bytes * 1000U) / 32000U);
-  uint32_t checkpoint_age = runtime->checkpoint_ms > 0 &&
-                            now_ms > runtime->checkpoint_ms
-                              ? (uint32_t)(now_ms - runtime->checkpoint_ms) : 0;
-  ESP_LOGI(TAG,
-           "LY|LIVE_UPLOAD_DIAG|id=%s produced=%lu acked=%lu lag_bytes=%lu lag_ms=%lu chunks=%lu bytes=%lu sd_read_us=%llu sha_us=%llu http_us=%llu state_save_us=%llu checkpoint_age_ms=%lu",
-           item->session_id, (unsigned long)item->pcm_bytes,
-           (unsigned long)item->acknowledged_bytes, (unsigned long)lag_bytes,
-           (unsigned long)lag_ms, (unsigned long)runtime->chunks,
-           (unsigned long)runtime->bytes,
-           (unsigned long long)runtime->sd_read_us,
-           (unsigned long long)runtime->sha_us,
-           (unsigned long long)runtime->http_us,
-           (unsigned long long)runtime->state_save_us,
-           (unsigned long)checkpoint_age);
-  runtime->diag_ms = now_ms;
-  runtime->sd_read_us = 0;
-  runtime->sha_us = 0;
-  runtime->http_us = 0;
-  runtime->state_save_us = 0;
-  runtime->chunks = 0;
-  runtime->bytes = 0;
 }
 
 static void mark_live_gap(sd_upload_item_t *item, const char *reason) {
@@ -1727,8 +1650,7 @@ static uint32_t create_remote_session(sd_upload_item_t *item) {
       json_u32_value(reply, "received_chunks", &received_chunks) &&
       received_chunks == next &&
       json_u32_value(reply, "received_samples", &received_samples) &&
-      luoye_upload_progress_from_samples(item->pcm_bytes,
-                                         item->live_chunk_bytes,
+      luoye_upload_progress_from_samples(item->pcm_bytes, CHUNK_BYTES,
                                          next, received_samples,
                                          &acknowledged) &&
       json_u32_value(reply, "acknowledged_bytes", &acknowledged_reply) &&
@@ -1740,16 +1662,6 @@ static uint32_t create_remote_session(sd_upload_item_t *item) {
   if (!valid) {
     cJSON_Delete(reply);
     return retry_item(item, ESP_ERR_INVALID_RESPONSE, status, "create_response");
-  }
-  /* An idempotent create can recover a server-side session even when the
-     local upload.state was rebuilt. Infer the already-established geometry
-     from an exact live cursor so V2 never continues a V1.3 queue at 32 KiB. */
-  if (live_cursor && next > 0 && acknowledged % next == 0) {
-    uint32_t inferred_chunk_bytes = acknowledged / next;
-    if (inferred_chunk_bytes == LIVE_CHUNK_BYTES ||
-        inferred_chunk_bytes == LEGACY_CHUNK_BYTES) {
-      item->live_chunk_bytes = inferred_chunk_bytes;
-    }
   }
   snprintf(item->server_session_id, sizeof(item->server_session_id), "%s",
            server_id->valuestring);
@@ -1823,31 +1735,23 @@ static uint32_t resume_live_epoch(sd_upload_item_t *item) {
   return delay ? delay : 20;
 }
 
-static uint32_t upload_one_chunk(sd_upload_item_t *item, uint8_t *buffer,
-                                 live_upload_runtime_t *runtime) {
+static uint32_t upload_one_chunk(sd_upload_item_t *item, uint8_t *buffer) {
   uint32_t remaining = item->pcm_bytes - item->acknowledged_bytes;
-  uint32_t chunk_bytes = item->live_chunk_bytes;
-  if (!chunk_bytes) return retry_item(item, ESP_ERR_INVALID_STATE, 0,
-                                      "live_chunk_size");
-  if (!item->local_closed && remaining < chunk_bytes) return 0;
+  if (!item->local_closed && remaining < CHUNK_BYTES) return 0;
   luoye_upload_chunk_t chunk = {
     .seq = item->next_seq,
     .offset = item->acknowledged_bytes,
-    .length = remaining > chunk_bytes ? chunk_bytes : remaining,
+    .length = remaining > CHUNK_BYTES ? CHUNK_BYTES : remaining,
   };
   if (!chunk.length) return 0;
   size_t received = 0;
-  int64_t started_us = esp_timer_get_time();
-  esp_err_t error = sd_upload_reader_read(&runtime->reader, item, chunk.offset,
-                                          buffer, chunk.length, &received);
-  runtime->sd_read_us += (uint64_t)(esp_timer_get_time() - started_us);
+  esp_err_t error = sd_upload_read_audio(item, chunk.offset, buffer,
+                                         chunk.length, &received);
   if (error != ESP_OK || received != chunk.length) {
     return retry_item(item, error == ESP_OK ? ESP_FAIL : error, 0, "read_audio");
   }
   char hash[65], key[192], url[280];
-  started_us = esp_timer_get_time();
   sha256_hex(buffer, received, hash);
-  runtime->sha_us += (uint64_t)(esp_timer_get_time() - started_us);
   if (!luoye_upload_chunk_key(key, sizeof(key), item->session_id,
                               chunk.seq, hash)) {
     return retry_item(item, ESP_ERR_INVALID_SIZE, 0, "chunk_key");
@@ -1856,11 +1760,9 @@ static uint32_t upload_one_chunk(sd_upload_item_t *item, uint8_t *buffer,
            server_base_url(), item->server_session_id, (unsigned long)chunk.seq);
   response_buffer_t response = {0};
   int status = 0;
-  started_us = esp_timer_get_time();
   error = cloud_request(HTTP_METHOD_PUT, url,
                          "audio/L16;rate=16000;channels=1", key,
                          buffer, received, &chunk, hash, &response, &status);
-  runtime->http_us += (uint64_t)(esp_timer_get_time() - started_us);
   luoye_upload_http_class_t classification =
       luoye_upload_classify_http(error == ESP_OK, status);
   if (classification != LUOYE_UPLOAD_HTTP_OK) {
@@ -1870,32 +1772,23 @@ static uint32_t upload_one_chunk(sd_upload_item_t *item, uint8_t *buffer,
   cJSON *accepted = reply ? cJSON_GetObjectItemCaseSensitive(reply, "accepted") : NULL;
   cJSON *duplicate = reply ? cJSON_GetObjectItemCaseSensitive(reply, "duplicate") : NULL;
   uint32_t reply_seq = 0, next = 0, acknowledged = 0;
-  bool replayed = cJSON_IsTrue(duplicate);
   bool valid = (cJSON_IsTrue(accepted) || cJSON_IsTrue(duplicate)) &&
       json_u32_value(reply, "seq", &reply_seq) && reply_seq == chunk.seq &&
       json_u32_value(reply, "live_next_seq", &next) &&
       json_u32_value(reply, "live_acknowledged_bytes", &acknowledged) &&
-      next >= chunk.seq + 1U && acknowledged >= chunk.offset + chunk.length &&
-      acknowledged <= item->pcm_bytes &&
-      ((!replayed && next == chunk.seq + 1U &&
-        acknowledged == chunk.offset + chunk.length) || replayed);
+      next == chunk.seq + 1U &&
+      acknowledged == chunk.offset + chunk.length;
   cJSON_Delete(reply);
   if (!valid) return retry_item(item, ESP_ERR_INVALID_RESPONSE, status, "audio_ack");
   item->next_seq = next;
   item->acknowledged_bytes = acknowledged;
-  item->retry_count = 0;
-  item->last_http_status = 0;
-  snprintf(item->state, sizeof(item->state), "uploading");
-  runtime->chunks++;
-  runtime->bytes += (uint32_t)received;
-  runtime->chunks_since_poll++;
-  uint32_t delay = live_checkpoint(item, runtime, false,
-                                   replayed ? "server_reconcile" : "interval");
-  ESP_LOGI(TAG, "LY|UPLOAD|id=%s phase=audio seq=%lu offset=%lu bytes=%lu lag_bytes=%lu server_next=%lu replay=%d result=acked",
-           item->session_id, (unsigned long)chunk.seq,
-           (unsigned long)chunk.offset, (unsigned long)chunk.length,
-           (unsigned long)(item->pcm_bytes - item->acknowledged_bytes),
-           (unsigned long)next, replayed);
+  uint32_t delay = save_stage(item, "uploading");
+  if (!delay) {
+    ESP_LOGI(TAG, "LY|UPLOAD|id=%s phase=audio seq=%lu offset=%lu bytes=%lu lag_bytes=%lu result=acked",
+             item->session_id, (unsigned long)chunk.seq,
+             (unsigned long)chunk.offset, (unsigned long)chunk.length,
+             (unsigned long)(item->pcm_bytes - item->acknowledged_bytes));
+  }
   return delay ? delay : 20;
 }
 
@@ -1969,12 +1862,22 @@ static esp_err_t hash_audio_range(const sd_upload_item_t *item,
     ESP_LOGW(TAG,
              "LY|UPLOAD_DIAG|id=%s event=range_hash_cache result=%s fallback=scan",
              item->session_id, esp_err_to_name(cached));
+    if (storage_sd_faulted()) return cached;
   }
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[SD_UPLOAD_DIR_BYTES + 16];
   snprintf(path, sizeof(path), "%s/audio.wav", item->directory);
   FILE *file = fopen(path, "rb");
-  if (!file) return ESP_ERR_NOT_FOUND;
-  esp_err_t result = storage_sd_seek(file, 44U + offset);
+  if (!file) {
+    int open_errno = errno;
+    report_uploader_storage_errno("range_audio_open", open_errno);
+    return open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
+  esp_err_t result = fseek(file, 44L + (long)offset, SEEK_SET) == 0
+                       ? ESP_OK : ESP_FAIL;
+  if (result != ESP_OK) {
+    report_uploader_storage_errno("range_audio_seek", errno);
+  }
   mbedtls_sha256_context context;
   unsigned char digest[32];
   mbedtls_sha256_init(&context);
@@ -2013,7 +1916,7 @@ static esp_err_t hash_audio_range(const sd_upload_item_t *item,
     if (diag) diag->sha_us += (uint64_t)(esp_timer_get_time() - started_us);
   }
   mbedtls_sha256_free(&context);
-  fclose(file);
+  if (!storage_sd_faulted()) fclose(file);
   if (result == ESP_OK) digest_hex(digest, hash);
   if (diag) diag->total_us = (uint64_t)(esp_timer_get_time() - total_started_us);
   return result;
@@ -2039,10 +1942,23 @@ static esp_err_t http_write_block(esp_http_client_handle_t client,
 }
 
 static esp_err_t stream_range_serial(esp_http_client_handle_t client,
-                                     FILE *file, uint32_t length,
+                                     const char *path,
+                                     uint32_t offset, uint32_t length,
                                      uint8_t *scratch, size_t scratch_size,
                                      range_http_diag_t *diag) {
-  if (!file) return ESP_ERR_INVALID_ARG;
+  if (!storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
+  FILE *file = fopen(path, "rb");
+  if (!file) {
+    int open_errno = errno;
+    report_uploader_storage_errno("stream_audio_open", open_errno);
+    return open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+  }
+  if (fseek(file, 44L + (long)offset, SEEK_SET) != 0) {
+    int seek_errno = errno;
+    report_uploader_storage_errno("stream_audio_seek", seek_errno);
+    if (!storage_sd_faulted()) fclose(file);
+    return ESP_FAIL;
+  }
   esp_err_t result = ESP_OK;
   uint32_t remaining = length;
   while (result == ESP_OK && remaining) {
@@ -2062,6 +1978,7 @@ static esp_err_t stream_range_serial(esp_http_client_handle_t client,
     result = http_write_block(client, scratch, read, diag);
     remaining -= (uint32_t)read;
   }
+  if (!storage_sd_faulted()) fclose(file);
   return result;
 }
 
@@ -2076,19 +1993,11 @@ static esp_err_t cloud_stream_audio_range(const sd_upload_item_t *item,
   int64_t total_started_us = esp_timer_get_time();
   if (diag) memset(diag, 0, sizeof(*diag));
   if (!cloud_transport_clock_ready() || !item || !sha256 || !scratch ||
-      !length || length > RANGE_BLOCK_BYTES || offset > UINT32_MAX - 44U ||
-      (offset & 1U) || (length & 1U)) {
+      !length || length > RANGE_BLOCK_BYTES || (offset & 1U) || (length & 1U)) {
     return ESP_ERR_INVALID_ARG;
   }
   char path[SD_UPLOAD_DIR_BYTES + 16];
   snprintf(path, sizeof(path), "%s/audio.wav", item->directory);
-  FILE *file = fopen(path, "rb");
-  if (!file) return ESP_ERR_NOT_FOUND;
-  esp_err_t error = storage_sd_prepare_range(file, 44U + offset);
-  if (error != ESP_OK) {
-    fclose(file);
-    return error;
-  }
   char url[300], key[192];
   snprintf(url, sizeof(url), "%s/api/v2/device/sessions/%s/audio-range",
            server_base_url(), item->server_session_id);
@@ -2104,10 +2013,7 @@ static esp_err_t cloud_stream_audio_range(const sd_upload_item_t *item,
                            ? NULL : esp_crt_bundle_attach,
   };
   esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client) {
-    fclose(file);
-    return ESP_ERR_NO_MEM;
-  }
+  if (!client) return ESP_ERR_NO_MEM;
   if (response) memset(response, 0, sizeof(*response));
   esp_http_client_set_header(client, "Content-Type",
                              "audio/L16;rate=16000;channels=1");
@@ -2125,13 +2031,13 @@ static esp_err_t cloud_stream_audio_range(const sd_upload_item_t *item,
   set_authorization(client);
 
   int64_t connect_started_us = esp_timer_get_time();
-  error = esp_http_client_open(client, (int)length);
+  esp_err_t error = esp_http_client_open(client, (int)length);
   if (diag) {
     diag->connect_us = (uint64_t)(esp_timer_get_time() - connect_started_us);
   }
   if (error == ESP_OK) {
-    error = stream_range_serial(client, file, length, scratch, scratch_size,
-                                diag);
+    error = stream_range_serial(client, path, offset, length, scratch,
+                                scratch_size, diag);
   }
   if (error == ESP_OK) {
     int64_t response_started_us = esp_timer_get_time();
@@ -2156,7 +2062,6 @@ static esp_err_t cloud_stream_audio_range(const sd_upload_item_t *item,
   }
   int status = esp_http_client_get_status_code(client);
   esp_http_client_cleanup(client);
-  fclose(file);
   if (http_status) *http_status = status;
   if (diag) diag->total_us = (uint64_t)(esp_timer_get_time() - total_started_us);
   return error;
@@ -2231,14 +2136,10 @@ static uint32_t upload_one_range(sd_upload_item_t *item,
   wifi_ap_record_t ap = {0};
   esp_err_t ap_error = esp_wifi_sta_get_ap_info(&ap);
   ESP_LOGI(TAG,
-           "LY|UPLOAD_DIAG|id=%s event=range_begin route=%s rssi=%d offset=%lu bytes=%lu scratch=%u mode=serial free_internal=%u largest_dma=%u",
+           "LY|UPLOAD_DIAG|id=%s event=range_begin route=%s rssi=%d offset=%lu bytes=%lu scratch=%u mode=serial",
            item->session_id, s_use_lan_server ? "lan" : "public",
            ap_error == ESP_OK ? ap.rssi : 0, (unsigned long)plan->offset,
-           (unsigned long)plan->length, (unsigned)scratch_size,
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
-                                             MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                      MALLOC_CAP_DMA));
+           (unsigned long)plan->length, (unsigned)scratch_size);
   char hash[65];
   range_hash_diag_t hash_diag = {0};
   esp_err_t error = hash_audio_range(item, plan->offset, plan->length,
@@ -2323,15 +2224,11 @@ static bool json_u32_value(cJSON *root, const char *name, uint32_t *out) {
 
 static bool live_parse(const sd_upload_item_t *item,
                        const response_buffer_t *response,
-                       luoye_live_result_t *out,
-                       luoye_live_caption_t *caption_updates,
-                       uint8_t *caption_update_count) {
-  if (!item || !response || !out || !caption_updates ||
-      !caption_update_count || response->overflow) return false;
+                       luoye_live_result_t *out) {
+  if (!item || !response || !out || response->overflow) return false;
   cJSON *root = cJSON_Parse(response->data);
   if (!root) return false;
   memset(out, 0, sizeof(*out));
-  *caption_update_count = 0;
   cJSON *client_id = cJSON_GetObjectItemCaseSensitive(root, "client_session_id");
   cJSON *server_id = cJSON_GetObjectItemCaseSensitive(root, "server_session_id");
   cJSON *scene = cJSON_GetObjectItemCaseSensitive(root, "scene");
@@ -2343,33 +2240,9 @@ static bool live_parse(const sd_upload_item_t *item,
                       strcmp(status_text, "processing") == 0 ||
                       strcmp(status_text, "done") == 0 ||
                       strcmp(status_text, "failed") == 0;
-  uint32_t revision = 0, display_revision = item->display_revision;
-  uint32_t caption_revision = item->caption_revision;
-  uint32_t speaker_revision = item->speaker_revision;
-  uint32_t translation_revision = item->translation_revision;
-  uint32_t summary_revision = item->summary_revision;
-  bool revision_channels_supported =
-      json_u32_value(root, "caption_revision", &caption_revision) &&
-      json_u32_value(root, "speaker_revision", &speaker_revision) &&
-      json_u32_value(root, "translation_revision", &translation_revision) &&
-      json_u32_value(root, "summary_revision", &summary_revision);
-  uint32_t received_samples = 0, contiguous = 0;
-  cJSON *partial = cJSON_GetObjectItemCaseSensitive(root, "partial");
-  cJSON *partial_active = cJSON_IsObject(partial)
-                              ? cJSON_GetObjectItemCaseSensitive(partial,
-                                                                 "active")
-                              : NULL;
-  cJSON *partial_text = cJSON_IsObject(partial)
-                            ? cJSON_GetObjectItemCaseSensitive(partial, "text")
-                            : NULL;
-  bool partial_supported = cJSON_IsObject(partial) &&
-      json_u32_value(root, "display_revision", &display_revision);
-  bool partial_valid = !partial_supported ||
-      (cJSON_IsBool(partial_active) && cJSON_IsString(partial_text) &&
-       (!cJSON_IsTrue(partial_active) || partial_text->valuestring[0]));
+  uint32_t revision = 0, received_samples = 0, contiguous = 0;
   bool valid = cJSON_IsString(client_id) && cJSON_IsString(server_id) &&
       cJSON_IsString(scene) && status_valid && cJSON_IsTrue(changed) &&
-      partial_valid &&
       cJSON_IsObject(upload) &&
       strcmp(client_id->valuestring, item->session_id) == 0 &&
       strcmp(server_id->valuestring, item->server_session_id) == 0 &&
@@ -2378,97 +2251,27 @@ static bool live_parse(const sd_upload_item_t *item,
       json_u32_value(upload, "received_samples", &received_samples) &&
       received_samples <= UINT32_MAX / 2U;
   if (valid) contiguous = received_samples * 2U;
-  bool final_advanced = revision > item->result_revision;
-  bool display_advanced = partial_supported &&
-                          display_revision > item->display_revision;
-  bool channel_monotonic = revision_channels_supported &&
-      caption_revision >= item->caption_revision &&
-      speaker_revision >= item->speaker_revision &&
-      translation_revision >= item->translation_revision &&
-      summary_revision >= item->summary_revision;
-  bool channel_advanced = channel_monotonic &&
-      (caption_revision > item->caption_revision ||
-       speaker_revision > item->speaker_revision ||
-       translation_revision > item->translation_revision ||
-       summary_revision > item->summary_revision);
-  bool cursor_valid = final_advanced
-      ? luoye_live_cursor_accept(item->result_revision,
-                                 item->result_pcm_bytes,
-                                 item->acknowledged_bytes,
-                                 revision, contiguous)
-      : revision == item->result_revision && display_advanced &&
-        contiguous >= item->result_pcm_bytes &&
-        contiguous <= item->acknowledged_bytes;
-  if (!cursor_valid && channel_advanced &&
-      revision >= item->result_revision &&
-      contiguous >= item->result_pcm_bytes &&
-      contiguous <= item->acknowledged_bytes) {
-    cursor_valid = true;
-  }
-  valid = valid && cursor_valid &&
+  valid = valid &&
+      luoye_live_cursor_accept(item->result_revision,
+                               item->result_pcm_bytes,
+                               item->acknowledged_bytes,
+                               revision, contiguous) &&
       luoye_live_set_text(out->client_session_id,
                           sizeof(out->client_session_id), item->session_id) &&
       luoye_live_set_text(out->server_session_id,
                           sizeof(out->server_session_id), item->server_session_id);
   if (valid && strcmp(item->scene, "meeting") == 0) {
-    cJSON *captions = revision_channels_supported
-                        ? cJSON_GetObjectItemCaseSensitive(root,
-                                                           "caption_updates")
-                        : NULL;
-    if (!cJSON_IsArray(captions)) {
-      captions = cJSON_GetObjectItemCaseSensitive(root, "captions");
-    }
+    cJSON *captions = cJSON_GetObjectItemCaseSensitive(root, "captions");
     int count = cJSON_IsArray(captions) ? cJSON_GetArraySize(captions) : 0;
     valid = cJSON_IsArray(captions);
     for (int index = 0; valid && index < count; index++) {
       cJSON *caption = cJSON_GetArrayItem(captions, index);
-      cJSON *seg_id = cJSON_IsObject(caption)
-                        ? cJSON_GetObjectItemCaseSensitive(caption, "seg_id") : NULL;
       cJSON *text = cJSON_IsObject(caption)
                       ? cJSON_GetObjectItemCaseSensitive(caption, "text") : NULL;
-      valid = *caption_update_count < LIVE_CAPTION_UPDATES_MAX &&
-              cJSON_IsString(seg_id) && seg_id->valuestring[0] &&
-              cJSON_IsString(text) && text->valuestring[0] &&
-              luoye_live_set_text(
-                  caption_updates[*caption_update_count].seg_id,
-                  sizeof(caption_updates[*caption_update_count].seg_id),
-                  seg_id->valuestring) &&
-              luoye_live_set_text(
-                  caption_updates[*caption_update_count].text,
-                  sizeof(caption_updates[*caption_update_count].text),
-                  text->valuestring);
-      if (valid) (*caption_update_count)++;
-    }
-    cJSON *timeline = cJSON_GetObjectItemCaseSensitive(root, "timeline");
-    if (valid && cJSON_IsObject(timeline)) {
-      cJSON *title = cJSON_GetObjectItemCaseSensitive(timeline, "title");
-      cJSON *items = cJSON_GetObjectItemCaseSensitive(timeline, "items");
-      uint32_t number = 0, start = 0, mark_count = 0;
-      bool timeline_valid = cJSON_IsString(title) && title->valuestring[0] &&
-          cJSON_IsArray(items) && json_u32_value(timeline, "chapter_no", &number) &&
-          number > 0 && number <= UINT16_MAX &&
-          json_u32_value(timeline, "start_ms", &start) &&
-          json_u32_value(timeline, "mark_count", &mark_count) &&
-          mark_count <= UINT8_MAX;
-      int item_count = cJSON_IsArray(items) ? cJSON_GetArraySize(items) : 0;
-      cJSON *first = item_count > 0 ? cJSON_GetArrayItem(items, 0) : NULL;
-      cJSON *second = item_count > 1 ? cJSON_GetArrayItem(items, 1) : NULL;
-      timeline_valid = timeline_valid &&
-          (!first || cJSON_IsString(first)) && (!second || cJSON_IsString(second)) &&
-          luoye_live_set_text(out->chapter_title, sizeof(out->chapter_title),
-                              title->valuestring) &&
-          (!first || luoye_live_set_text(out->chapter_item_1,
-                                         sizeof(out->chapter_item_1), first->valuestring)) &&
-          (!second || luoye_live_set_text(out->chapter_item_2,
-                                          sizeof(out->chapter_item_2), second->valuestring));
-      if (timeline_valid) {
-        out->timeline_available = true;
-        out->chapter_no = (uint16_t)number;
-        out->chapter_start_ms = start;
-        out->chapter_mark_count = (uint8_t)mark_count;
-      } else {
-        ESP_LOGW(TAG, "LY|TIMELINE|result=invalid_payload");
-      }
+      valid = cJSON_IsString(text) &&
+              luoye_live_append_text(out->meeting_text,
+                                     sizeof(out->meeting_text),
+                                     text->valuestring);
     }
     cJSON *speaker = cJSON_GetObjectItemCaseSensitive(root, "speaker");
     if (valid && cJSON_IsObject(speaker)) {
@@ -2526,20 +2329,7 @@ static bool live_parse(const sd_upload_item_t *item,
   }
   if (valid) {
     out->revision = revision;
-    out->display_revision = display_revision;
-    out->caption_revision = caption_revision;
-    out->speaker_revision = speaker_revision;
-    out->translation_revision = translation_revision;
-    out->summary_revision = summary_revision;
-    out->revision_channels_supported = revision_channels_supported;
     out->contiguous_pcm_bytes = contiguous;
-    out->partial_supported = partial_supported;
-    out->partial_active = partial_supported && cJSON_IsTrue(partial_active);
-    if (partial_supported &&
-        !luoye_live_set_text(out->partial_text, sizeof(out->partial_text),
-                             partial_text->valuestring)) {
-      valid = false;
-    }
     out->final = strcmp(status_text, "done") == 0 ||
                  strcmp(status_text, "failed") == 0;
     out->failed = strcmp(status_text, "failed") == 0;
@@ -2548,69 +2338,21 @@ static bool live_parse(const sd_upload_item_t *item,
   return valid;
 }
 
-static void live_publish(const luoye_live_result_t *result,
-                         const luoye_live_caption_t *caption_updates,
-                         uint8_t caption_update_count) {
-  if (!s_live_lock || !result || !caption_updates) return;
+static void live_publish(const luoye_live_result_t *result) {
+  if (!s_live_lock || !result) return;
   xSemaphoreTake(s_live_lock, portMAX_DELAY);
   if (!s_live.client_session_id[0] ||
       strcmp(s_live.client_session_id, result->client_session_id) == 0) {
     luoye_live_result_t merged = *result;
-    bool same_result = strcmp(s_live.client_session_id,
-                              result->client_session_id) == 0 &&
-                       s_live.kind == result->kind;
-    if (result->kind == LUOYE_LIVE_MEETING) {
-      bool caption_changed = false;
-      for (uint8_t i = 0; i < caption_update_count; ++i) {
-        caption_changed = luoye_live_caption_upsert(
-                              &s_live_captions,
-                              caption_updates[i].seg_id,
-                              caption_updates[i].text) || caption_changed;
-      }
-      bool caption_built = luoye_live_caption_build(
-          &s_live_captions, merged.meeting_text, sizeof(merged.meeting_text));
-      if (!caption_built) {
-        if (same_result) {
-          strlcpy(merged.meeting_text, s_live.meeting_text,
-                  sizeof(merged.meeting_text));
-        }
-      }
-      bool caption_pixels_changed = caption_built && caption_changed &&
-          (!same_result ||
-           strcmp(merged.meeting_text, s_live.meeting_text) != 0);
-      merged.caption_generation = (same_result
-                                      ? s_live.caption_generation : 0U) +
-                                  (caption_pixels_changed ? 1U : 0U);
-      bool partial_changed = merged.partial_supported &&
-          (!same_result || !s_live.partial_supported ||
-           merged.partial_active != s_live.partial_active ||
-           strcmp(merged.partial_text, s_live.partial_text) != 0);
-      merged.partial_generation = (same_result
-                                      ? s_live.partial_generation : 0U) +
-                                  (partial_changed ? 1U : 0U);
-      if (same_result) {
-        if (!result->timeline_available && s_live.timeline_available) {
-          merged.timeline_available = true;
-          merged.chapter_no = s_live.chapter_no;
-          merged.chapter_start_ms = s_live.chapter_start_ms;
-          merged.chapter_mark_count = s_live.chapter_mark_count;
-          strlcpy(merged.chapter_title, s_live.chapter_title,
-                  sizeof(merged.chapter_title));
-          strlcpy(merged.chapter_item_1, s_live.chapter_item_1,
-                  sizeof(merged.chapter_item_1));
-          strlcpy(merged.chapter_item_2, s_live.chapter_item_2,
-                  sizeof(merged.chapter_item_2));
-        }
-        if (!result->partial_supported && s_live.partial_supported) {
-          merged.partial_supported = true;
-          merged.partial_active = s_live.partial_active;
-          merged.display_revision = s_live.display_revision;
-          strlcpy(merged.partial_text, s_live.partial_text,
-                  sizeof(merged.partial_text));
-          merged.partial_generation = s_live.partial_generation;
-        }
-      }
-    } else if (same_result && result->kind == LUOYE_LIVE_TRANSLATION) {
+    if (strcmp(s_live.client_session_id, result->client_session_id) == 0 &&
+        s_live.kind == result->kind) {
+      if (result->kind == LUOYE_LIVE_MEETING) {
+        strlcpy(merged.meeting_text, s_live.meeting_text,
+                sizeof(merged.meeting_text));
+        luoye_live_append_text(merged.meeting_text,
+                               sizeof(merged.meeting_text),
+                               result->meeting_text);
+      } else if (result->kind == LUOYE_LIVE_TRANSLATION) {
         strlcpy(merged.source_text, s_live.source_text,
                 sizeof(merged.source_text));
         strlcpy(merged.translated_text, s_live.translated_text,
@@ -2629,20 +2371,17 @@ static void live_publish(const luoye_live_result_t *result,
           strlcpy(merged.target_language, s_live.target_language,
                   sizeof(merged.target_language));
         }
+      }
     }
     s_live = merged;
   }
   xSemaphoreGive(s_live_lock);
 }
 
-static uint32_t poll_live_result(sd_upload_item_t *item,
-                                 live_upload_runtime_t *runtime) {
+static uint32_t poll_live_result(sd_upload_item_t *item) {
   const char *waiting_state = "uploading";
-  char query[256], url[384];
-  if (!luoye_live_query(query, sizeof(query), item->result_revision,
-                        item->display_revision, item->caption_revision,
-                        item->speaker_revision, item->translation_revision,
-                        item->summary_revision)) {
+  char query[48], url[320];
+  if (!luoye_live_query(query, sizeof(query), item->result_revision)) {
     return LIVE_POLL_MS;
   }
   snprintf(url, sizeof(url), "%s/api/v2/device/sessions/%s/state%s",
@@ -2655,7 +2394,6 @@ static uint32_t poll_live_result(sd_upload_item_t *item,
   if (error != ESP_OK) {
     return retry_item(item, error, status, "live");
   }
-  runtime->chunks_since_poll = 0;
   if (status == 202 || status == 204 || status == 304) {
     if (item->retry_count || strcmp(item->state, waiting_state) != 0) {
       uint32_t delay = save_stage(item, waiting_state);
@@ -2687,54 +2425,33 @@ static uint32_t poll_live_result(sd_upload_item_t *item,
     return LIVE_POLL_MS;
   }
   luoye_live_result_t result;
-  luoye_live_caption_t caption_updates[LIVE_CAPTION_UPDATES_MAX] = {0};
-  uint8_t caption_update_count = 0;
-  if (!live_parse(item, &response, &result, caption_updates,
-                  &caption_update_count)) {
+  if (!live_parse(item, &response, &result)) {
     ESP_LOGW(TAG, "LY|LIVE|id=%s result=invalid_response http=%d",
              item->session_id, status);
     return LIVE_POLL_MS;
   }
   item->result_revision = result.revision;
-  item->display_revision = result.display_revision;
-  if (result.revision_channels_supported) {
-    item->caption_revision = result.caption_revision;
-    item->speaker_revision = result.speaker_revision;
-    item->translation_revision = result.translation_revision;
-    item->summary_revision = result.summary_revision;
-  }
   item->result_pcm_bytes = result.contiguous_pcm_bytes;
   item->retry_count = 0;
   item->last_http_status = 0;
   snprintf(item->state, sizeof(item->state), "%s",
            result.failed ? "result_failed" :
            result.final ? "done" : waiting_state);
-  uint32_t checkpoint_delay = live_checkpoint(item, runtime, false,
-                                               "result_interval");
-  if (checkpoint_delay) return checkpoint_delay;
-  live_publish(&result, caption_updates, caption_update_count);
+  if (sd_upload_save(item) != ESP_OK) {
+    return retry_item(item, ESP_FAIL, 0, "live_persist");
+  }
+  live_publish(&result);
   ESP_LOGI(TAG,
-           "LY|LIVE|id=%s revision=%lu caption_revision=%lu display_revision=%lu contiguous=%lu kind=%d final=%d partial=%d chars=%u channels=%d",
+           "LY|LIVE|id=%s revision=%lu contiguous=%lu kind=%d final=%d",
            item->session_id, (unsigned long)result.revision,
-           (unsigned long)result.caption_revision,
-           (unsigned long)result.display_revision,
            (unsigned long)result.contiguous_pcm_bytes,
-           (int)result.kind, result.final, result.partial_active,
-           (unsigned)strlen(result.partial_text),
-           result.revision_channels_supported);
+           (int)result.kind, result.final);
   if (result.kind == LUOYE_LIVE_MEETING) {
     ESP_LOGI(TAG,
              "LY|SPEAKER|id=%s enabled=%d labeled=%u speakers=%u",
              item->session_id, result.speaker_enabled,
              (unsigned)result.speaker_labeled_segments,
              (unsigned)result.speaker_count);
-    if (result.timeline_available) {
-      ESP_LOGI(TAG,
-               "LY|TIMELINE|id=%s chapter=%u start_ms=%lu marks=%u",
-               item->session_id, (unsigned)result.chapter_no,
-               (unsigned long)result.chapter_start_ms,
-               (unsigned)result.chapter_mark_count);
-    }
   }
   return result.final ? 3000 : LIVE_POLL_MS;
 }
@@ -2804,20 +2521,34 @@ static uint32_t upload_one_mark(sd_upload_item_t *item, const char *line_text,
 
 static uint32_t upload_marks(sd_upload_item_t *item, uint8_t *marks_buffer,
                              bool close_time) {
+  if (!storage_sd_mounted()) {
+    return retry_item(item, ESP_ERR_INVALID_STATE, 0, "read_marks_gate");
+  }
   char path[SD_UPLOAD_DIR_BYTES + 24];
   snprintf(path, sizeof(path), "%s/marks.jsonl", item->directory);
   FILE *stream = fopen(path, "rb");
-  if (!stream) return retry_item(item, ESP_ERR_NOT_FOUND, 0, "read_marks");
+  if (!stream) {
+    int open_errno = errno;
+    report_uploader_storage_errno("marks_open", open_errno);
+    return retry_item(item,
+                      open_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL,
+                      0, "read_marks");
+  }
 
   uint32_t index = 0;
   for (;;) {
+    if (storage_sd_faulted()) {
+      return retry_item(item, ESP_FAIL, 0, "read_marks_loop_gate");
+    }
     size_t line_length = 0;
     luoye_upload_mark_read_t read = luoye_upload_read_mark_line(
         stream, (char *)marks_buffer, MARKS_BUFFER_BYTES,
         &index, &line_length);
     if (read == LUOYE_UPLOAD_MARK_EOF) break;
     if (read == LUOYE_UPLOAD_MARK_IO_ERROR) {
-      fclose(stream);
+      int read_errno = errno;
+      report_uploader_storage_errno("marks_read", read_errno);
+      if (!storage_sd_faulted()) fclose(stream);
       return retry_item(item, ESP_FAIL, 0, "read_marks");
     }
     if (read == LUOYE_UPLOAD_MARK_SKIPPED) {
@@ -2830,11 +2561,14 @@ static uint32_t upload_marks(sd_upload_item_t *item, uint8_t *marks_buffer,
     (void)line_length;
     uint32_t delay = upload_one_mark(item, (char *)marks_buffer, index);
     if (delay) {
-      fclose(stream);
+      if (!storage_sd_faulted()) fclose(stream);
       return delay;
     }
   }
-  fclose(stream);
+  if (!storage_sd_faulted()) fclose(stream);
+  if (storage_sd_faulted()) {
+    return retry_item(item, ESP_FAIL, 0, "read_marks_close_gate");
+  }
   if (!close_time) {
     ESP_LOGI(TAG, "LY|UPLOAD|id=%s phase=marks result=live_acked",
              item->session_id);
@@ -2861,7 +2595,11 @@ static bool live_marks_changed(const sd_upload_item_t *item, off_t *size_out) {
     s_live_marks_uploaded_size = -1;
   }
   snprintf(path, sizeof(path), "%s/marks.jsonl", item->directory);
-  if (stat(path, &st) != 0) return false;
+  if (!storage_sd_mounted()) return false;
+  if (stat(path, &st) != 0) {
+    report_uploader_storage_errno("marks_stat", errno);
+    return false;
+  }
   if (st.st_size == s_live_marks_uploaded_size) return false;
   if (size_out) *size_out = st.st_size;
   return true;
@@ -2934,10 +2672,8 @@ static uint32_t defer_gap_session(sd_upload_item_t *item) {
 static uint32_t finalize_session(sd_upload_item_t *item) {
   cJSON *root = cJSON_CreateObject();
   if (!root) return retry_item(item, ESP_ERR_NO_MEM, 0, "final_json");
-  /* next_seq is authoritative and remains correct for sessions started by
-     160 KiB firmware. Never reinterpret an existing sequence using the new
-     32 KiB live size. */
-  uint32_t total_chunks = item->next_seq;
+  uint32_t total_chunks = item->pcm_bytes / CHUNK_BYTES;
+  if (item->pcm_bytes % CHUNK_BYTES) total_chunks++;
   cJSON_AddNumberToObject(root, "total_chunks", total_chunks);
   cJSON_AddNumberToObject(root, "total_samples", item->pcm_bytes / 2U);
   if (!json_add_utc_or_null(root, "ended_at_utc", item->ended_at_utc)) {
@@ -2979,7 +2715,7 @@ static uint32_t finalize_session(sd_upload_item_t *item) {
         (double)(uint32_t)first->valuedouble == first->valuedouble;
     if (recoverable) {
       item->next_seq = (uint32_t)first->valuedouble;
-      uint64_t offset = (uint64_t)item->next_seq * item->live_chunk_bytes;
+      uint64_t offset = (uint64_t)item->next_seq * CHUNK_BYTES;
       item->acknowledged_bytes = offset > item->pcm_bytes
                                    ? item->pcm_bytes : (uint32_t)offset;
       cJSON_Delete(conflict);
@@ -3070,40 +2806,13 @@ static uint32_t complete_range_session(sd_upload_item_t *item) {
 
 static uint32_t process_upload_item(sd_upload_item_t *item, uint8_t *audio_buffer,
                                     uint8_t *marks_buffer,
-                                    uint8_t *range_buffer,
-                                    live_upload_runtime_t *live_runtime) {
-  if (item->live_chunk_bytes == 0) {
-    /* upload.state from v1.3.0 has no explicit size. A non-zero sequence was
-       necessarily produced by the legacy 160 KiB contract; untouched queues
-       can safely start with V2's one-second chunks. */
-    item->live_chunk_bytes = item->next_seq > 0
-                               ? LEGACY_CHUNK_BYTES : LIVE_CHUNK_BYTES;
-    if (sd_upload_save(item) != ESP_OK) {
-      return retry_item(item, ESP_FAIL, 0, "live_chunk_migrate");
-    }
-    ESP_LOGI(TAG, "LY|UPLOAD|id=%s event=chunk_contract bytes=%lu migrated=%d",
-             item->session_id, (unsigned long)item->live_chunk_bytes,
-             item->next_seq > 0);
-  }
-  if (item->live_chunk_bytes != LIVE_CHUNK_BYTES &&
-      item->live_chunk_bytes != LEGACY_CHUNK_BYTES) {
-    return retry_item(item, ESP_ERR_INVALID_SIZE, 0, "live_chunk_contract");
-  }
-  if (item->final_acked) {
-    sd_upload_reader_close(&live_runtime->reader);
-    return delete_cloud_accepted(item);
-  }
+                                    uint8_t *range_buffer) {
+  if (item->final_acked) return delete_cloud_accepted(item);
   if (item->live_resume_required && !item->local_closed) {
     if (!item->remote_session_created) return create_remote_session(item);
     return resume_live_epoch(item);
   }
   if (item->local_closed && strcmp(item->upload_mode, "live") == 0) {
-    if (!live_runtime->closed_checkpointed) {
-      uint32_t checkpoint_delay = live_checkpoint(item, live_runtime, true,
-                                                  "session_closed");
-      if (checkpoint_delay) return checkpoint_delay;
-      live_runtime->closed_checkpointed = true;
-    }
     uint32_t lag = item->pcm_bytes - item->acknowledged_bytes;
     if (item->live_resume_required && lag > 0) {
       item->deferred_gaps = true;
@@ -3123,7 +2832,7 @@ static uint32_t process_upload_item(sd_upload_item_t *item, uint8_t *audio_buffe
       snprintf(item->upload_mode, sizeof(item->upload_mode), "bulk");
       uint32_t delay = save_stage(item, "bulk_pending");
       if (delay) return delay;
-    } else if (lag >= item->live_chunk_bytes) {
+    } else if (lag >= CHUNK_BYTES) {
       snprintf(item->upload_mode, sizeof(item->upload_mode), "repair");
       uint32_t delay = save_stage(item, "repair_pending");
       if (delay) return delay;
@@ -3131,9 +2840,8 @@ static uint32_t process_upload_item(sd_upload_item_t *item, uint8_t *audio_buffe
   }
   if (!item->remote_session_created) return create_remote_session(item);
   bool range_mode = strcmp(item->upload_mode, "bulk") == 0 ||
-                     strcmp(item->upload_mode, "repair") == 0;
+                    strcmp(item->upload_mode, "repair") == 0;
   if (range_mode) {
-    sd_upload_reader_close(&live_runtime->reader);
     range_plan_t plan;
     uint32_t delay = request_upload_plan(item, &plan);
     if (delay) return delay;
@@ -3145,26 +2853,10 @@ static uint32_t process_upload_item(sd_upload_item_t *item, uint8_t *audio_buffe
     return complete_range_session(item);
   }
   int64_t now_ms = esp_timer_get_time() / 1000;
-  uint32_t lag_bytes = item->pcm_bytes - item->acknowledged_bytes;
-  uint32_t poll_interval = live_poll_interval_ms(lag_bytes);
-  bool poll_due = !item->local_closed && now_ms >= s_next_live_poll_ms;
-  uint32_t poll_chunk_gate = lag_bytes > 5U * 32000U ? 3U :
-                             lag_bytes > 2U * 32000U ? 2U : 1U;
-  /* PCM is the source of every downstream partial/final result. When a full
-     one-second chunk is ready, transmit it before spending the serial cloud
-     lane on a state GET. */
-  if (!item->local_closed && lag_bytes >= item->live_chunk_bytes &&
-      (!poll_due || live_runtime->chunks_since_poll < poll_chunk_gate)) {
-    uint32_t delay = upload_one_chunk(item, audio_buffer, live_runtime);
-    if (delay) return delay;
-  }
-  if (poll_due) {
-    uint32_t poll_delay = poll_live_result(item, live_runtime);
-    if (poll_delay < poll_interval) poll_delay = poll_interval;
-    s_next_live_poll_ms = now_ms + poll_delay;
-    /* A state GET must never impose its polling delay on the audio lane.
-       Re-enter quickly so newly committed PCM is uploaded first. */
-    return 20;
+  if (!item->local_closed && now_ms >= s_next_live_poll_ms) {
+    s_next_live_poll_ms = now_ms + LIVE_POLL_DEADLINE_MS;
+    uint32_t delay = poll_live_result(item);
+    return delay > LIVE_POLL_DEADLINE_MS ? LIVE_POLL_DEADLINE_MS : delay;
   }
   off_t marks_size = 0;
   if (!item->local_closed && live_marks_changed(item, &marks_size)) {
@@ -3173,16 +2865,10 @@ static uint32_t process_upload_item(sd_upload_item_t *item, uint8_t *audio_buffe
     return delay;
   }
   if (item->acknowledged_bytes < item->pcm_bytes) {
-    uint32_t delay = upload_one_chunk(item, audio_buffer, live_runtime);
+    uint32_t delay = upload_one_chunk(item, audio_buffer);
     if (delay) return delay;
   }
-  if (!item->local_closed) {
-    int64_t until_poll = s_next_live_poll_ms - now_ms;
-    if (until_poll > 20 && until_poll < LIVE_UPLOAD_CHECK_MS) {
-      return (uint32_t)until_poll;
-    }
-    return LIVE_UPLOAD_CHECK_MS;
-  }
+  if (!item->local_closed) return poll_live_result(item);
   if (!item->marks_acked) return upload_marks(item, marks_buffer, true);
   if (!item->final_acked) return finalize_session(item);
   return delete_cloud_accepted(item);
@@ -3776,49 +3462,60 @@ static void upload_task(void *argument) {
   char last_notified[LUOYE_TODO_ID_BYTES] = {0};
   uint32_t last_notified_revision = 0;
   char scheduled_upload_id[SD_UPLOAD_SESSION_ID_BYTES] = {0};
-  sd_upload_item_t live_item_cache = {0};
-  bool live_cache_valid = false;
-  live_upload_runtime_t live_runtime = {0};
+  uint32_t handled_manual_sync_revision = 0;
   for (;;) {
     int64_t now_ms = esp_timer_get_time() / 1000;
-    bulk_wifi_ps_update((s_manual_sync || s_live_session_id[0]) && s_online);
+    uint32_t requested_revision = s_manual_sync_request_revision;
+    if (requested_revision != handled_manual_sync_revision) {
+      handled_manual_sync_revision = requested_revision;
+      scheduled_upload_id[0] = '\0';
+      next_upload_ms = 0;
+      ESP_LOGI(TAG,
+               "LY|SYNC|state=rearmed revision=%lu next=upload_plan block_bytes=%u",
+               (unsigned long)requested_revision,
+               (unsigned)RANGE_BLOCK_BYTES);
+    }
+    bulk_wifi_ps_update(s_manual_sync && s_online);
+    /* A latched storage fault is a hard runtime boundary.  Do not scan the
+       filesystem again just to refresh backlog counters: keep the last known
+       values and wait for a reboot to perform a clean card initialization. */
+    if (storage_sd_faulted()) {
+      scheduled_upload_id[0] = '\0';
+      stop_for_storage_fault("scheduler", ESP_FAIL);
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
     if (now_ms >= next_backlog_ms) {
-      sd_upload_backlog(&sessions, &pending_bytes);
-      uint64_t backlog_s64 = pending_bytes ? (pending_bytes + 31999U) / 32000U :
-                             (sessions ? 1U : 0U);
-      int32_t backlog_s = (int32_t)(backlog_s64 > 65535U ? 65535U : backlog_s64);
-      if (s_post) s_post(APP_EV_BACKLOG, backlog_s);
-      if (sessions != last_sessions) {
-        ESP_LOGI(TAG, "LY|UPLOAD|event=backlog sessions=%lu pending_bytes=%llu",
-                 (unsigned long)sessions, (unsigned long long)pending_bytes);
-        last_sessions = sessions;
+      esp_err_t backlog_result = sd_upload_backlog(&sessions, &pending_bytes);
+      if (backlog_result == ESP_OK || backlog_result == ESP_ERR_NOT_FOUND) {
+        uint64_t backlog_s64 = pending_bytes ?
+            (pending_bytes + 31999U) / 32000U : (sessions ? 1U : 0U);
+        int32_t backlog_s =
+            (int32_t)(backlog_s64 > 65535U ? 65535U : backlog_s64);
+        if (s_post) s_post(APP_EV_BACKLOG, backlog_s);
+        if (sessions != last_sessions) {
+          ESP_LOGI(TAG,
+                   "LY|UPLOAD|event=backlog sessions=%lu pending_bytes=%llu",
+                   (unsigned long)sessions, (unsigned long long)pending_bytes);
+          last_sessions = sessions;
+        }
+      } else {
+        ESP_LOGE(TAG,
+                 "LY|UPLOAD|event=backlog result=scan_failed esp=%s keep_last=1",
+                 esp_err_to_name(backlog_result));
+        stop_manual_sync_scan_error("backlog", backlog_result);
       }
       next_backlog_ms = now_ms + 3000;
     }
     if (s_live_gap_signal && s_bound && s_live_session_id[0]) {
       sd_upload_item_t gap_item;
-      esp_err_t found = ESP_ERR_NOT_FOUND;
-      if (live_cache_valid &&
-          strcmp(live_item_cache.session_id, s_live_session_id) == 0 &&
-          sd_upload_refresh_current(&live_item_cache) == ESP_OK) {
-        gap_item = live_item_cache;
-        found = ESP_OK;
-      } else {
-        found = sd_upload_current(s_binding_generation, &gap_item);
-      }
+      esp_err_t found = sd_upload_current(s_binding_generation, &gap_item);
       if (found != ESP_OK) {
         found = sd_upload_find(s_binding_generation, s_live_session_id,
                                &gap_item);
       }
       if (found == ESP_OK) {
         mark_live_gap(&gap_item, "transport_offline");
-        live_item_cache = gap_item;
-        live_cache_valid = true;
-        if (strcmp(live_runtime.session_id, gap_item.session_id) != 0) {
-          live_runtime_begin(&live_runtime, &gap_item);
-        }
-        live_runtime.checkpoint_seq = gap_item.next_seq;
-        live_runtime.checkpoint_ms = now_ms;
         s_live_gap_signal = false;
       }
     }
@@ -3839,31 +3536,15 @@ static void upload_task(void *argument) {
         s_online && s_bound && !s_pair_requested &&
         s_contract_checked && s_cloud_ready &&
         audio_buffer && range_buffer && marks_buffer) {
-      sd_upload_item_t item = {0};
-      bool live_lane = false;
-      if (s_live_session_id[0] && live_cache_valid &&
-          strcmp(live_item_cache.session_id, s_live_session_id) == 0 &&
-          sd_upload_refresh_current(&live_item_cache) == ESP_OK) {
-        item = live_item_cache;
-        live_lane = true;
-      }
+      sd_upload_item_t item;
+      bool live_lane = sd_upload_current(s_binding_generation, &item) == ESP_OK;
       if (!live_lane && s_live_session_id[0]) {
-        live_lane = sd_upload_current(s_binding_generation, &item) == ESP_OK;
-        if (!live_lane) {
-          live_lane = sd_upload_find(s_binding_generation, s_live_session_id,
-                                     &item) == ESP_OK;
-        }
-        if (live_lane) {
-          live_item_cache = item;
-          live_cache_valid = true;
-          live_runtime_begin(&live_runtime, &item);
-        }
+        live_lane = sd_upload_find(s_binding_generation, s_live_session_id,
+                                   &item) == ESP_OK;
         if (!live_lane) {
           ESP_LOGI(TAG, "LY|UPLOAD|live_lane=released id=%s",
                    s_live_session_id);
           s_live_session_id[0] = '\0';
-          live_cache_valid = false;
-          live_runtime_reset(&live_runtime);
         }
       }
       if (live_lane && item.local_closed && item.deferred_gaps &&
@@ -3874,13 +3555,26 @@ static void upload_task(void *argument) {
                  item.session_id);
         s_live_session_id[0] = '\0';
         live_lane = false;
-        live_cache_valid = false;
-        live_runtime_reset(&live_runtime);
       }
       bool have_item = live_lane;
+      esp_err_t history_scan = ESP_ERR_NOT_FOUND;
       if (!have_item && s_manual_sync) {
-        live_runtime_reset(&live_runtime);
-        have_item = sd_upload_next(s_binding_generation, &item) == ESP_OK;
+        history_scan = sd_upload_next(s_binding_generation, &item);
+        have_item = history_scan == ESP_OK;
+        if (!have_item && history_scan != ESP_ERR_NOT_FOUND) {
+          scheduled_upload_id[0] = '\0';
+          if (storage_sd_faulted()) {
+            stop_for_storage_fault("select_history", history_scan);
+          } else {
+            stop_manual_sync_scan_error("select_history", history_scan);
+          }
+        }
+      }
+      if (storage_sd_faulted()) {
+        scheduled_upload_id[0] = '\0';
+        stop_for_storage_fault("select", ESP_FAIL);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        continue;
       }
       if (have_item && strcmp(scheduled_upload_id, item.session_id) != 0) {
         snprintf(scheduled_upload_id, sizeof(scheduled_upload_id), "%s",
@@ -3896,14 +3590,8 @@ static void upload_task(void *argument) {
                  lane, item.session_id, item.state, item.upload_mode);
         s_uploader_busy = true;
         uint32_t delay = process_upload_item(&item, audio_buffer, marks_buffer,
-                                             range_buffer, &live_runtime);
+                                             range_buffer);
         s_uploader_busy = false;
-        if (live_lane) {
-          live_item_cache = item;
-          live_cache_valid = !item.final_acked;
-          live_diag_maybe(&item, &live_runtime);
-          if (item.final_acked) live_runtime_reset(&live_runtime);
-        }
         next_upload_ms = now_ms + (delay < 20 ? 20 : delay);
         network_action = true;
         if (!stack_logged) {
@@ -3913,10 +3601,16 @@ static void upload_task(void *argument) {
                    (unsigned)sizeof(StackType_t));
         }
       } else if (s_manual_sync && !s_live_session_id[0]) {
-        if (!have_item) {
-          s_manual_sync = false;
-          if (s_post) s_post(APP_EV_SYNC_CHANGE, APP_SYNC_DONE);
-          ESP_LOGI(TAG, "LY|SYNC|state=complete local_queue=empty");
+        if (!have_item && history_scan == ESP_ERR_NOT_FOUND) {
+          /* A writer or scanner may latch FAULTED after the selection gate.
+             Never turn that narrow race into a false manual-sync success. */
+          if (storage_sd_faulted()) {
+            stop_for_storage_fault("complete_gate", ESP_FAIL);
+          } else {
+            s_manual_sync = false;
+            if (s_post) s_post(APP_EV_SYNC_CHANGE, APP_SYNC_DONE);
+            ESP_LOGI(TAG, "LY|SYNC|state=complete local_queue=empty");
+          }
         }
       }
 
@@ -3996,7 +3690,7 @@ static void upload_task(void *argument) {
     }
     /* Manual history sync is the bulk-upload lifetime. Restore the exact
        pre-upload power-save mode immediately after its queue completes. */
-    bulk_wifi_ps_update((s_manual_sync || s_live_session_id[0]) && s_online);
+    bulk_wifi_ps_update(s_manual_sync && s_online);
     vTaskDelay(pdMS_TO_TICKS(network_action ? 20 : 100));
   }
 }
@@ -4182,7 +3876,7 @@ esp_err_t net_uploader_init(net_post_fn post) {
      the durable SD queue. The todo buffer is optional; audio/range/marks are
      required for recording upload. */
   const uint32_t upload_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-  s_upload_buffers.audio = heap_caps_malloc(LEGACY_CHUNK_BYTES, upload_caps);
+  s_upload_buffers.audio = heap_caps_malloc(CHUNK_BYTES, upload_caps);
   s_upload_buffers.range = heap_caps_malloc(RANGE_STREAM_BYTES, upload_caps);
   s_upload_buffers.marks = heap_caps_malloc(MARKS_BUFFER_BYTES, upload_caps);
   s_upload_buffers.todo_audio = heap_caps_malloc(TODO_AUDIO_BYTES, upload_caps);

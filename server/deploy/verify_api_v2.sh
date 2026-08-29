@@ -3,7 +3,7 @@ set -euo pipefail
 
 base_url="${1:-${CLEARMEETING_BASE_URL:-http://127.0.0.1}}"
 base_url="${base_url%/}"
-expected_version="${EXPECTED_SERVER_VERSION:-1.0.1}"
+expected_version="${EXPECTED_SERVER_VERSION:-0.21.0}"
 expected_contract="${EXPECTED_API_CONTRACT:-luoye-device-api/2}"
 
 command -v curl >/dev/null 2>&1 || { echo "失败：需要 curl" >&2; exit 1; }
@@ -39,10 +39,9 @@ required = {"device_pairing", "idempotent_upload", "agenda_sync", "voice_todo",
 required.add("semantic_timeline_v2")
 required.add("semantic_timeline_v3_anchored")
 required.add("offline_asr_pipeline_v1")
-required.add("device_live_partial_caption_v1")
-required.add("device_live_partial_caption_v2")
-required.add("device_caption_upsert_v1")
-required.add("device_revision_channels_v1")
+required.update({"canonical_offline_diarization_v2", "transcript_only_live_v1",
+                 "template_minutes_v1", "editable_meeting_speakers_v1",
+                 "meeting_memory_v1", "on_demand_minutes_v1"})
 actual_version = body.get("server_version")
 actual_contract = body.get("api_contract")
 if actual_version != os.environ["VERIFY_EXPECTED_VERSION"]:
@@ -52,6 +51,8 @@ if actual_contract != os.environ["VERIFY_EXPECTED_CONTRACT"]:
 missing = sorted(required - set(body.get("capabilities") or []))
 if missing:
     raise SystemExit(f"build-info 缺少能力: {missing}")
+if "device_rolling_minutes" in set(body.get("capabilities") or []):
+    raise SystemExit("build-info 仍宣告已移除的 device_rolling_minutes")
 print("PASS  /api/v2/build-info")
 print("      release=" + str(body.get("server_release")))
 print("      minimum_firmware=" + str(body.get("minimum_firmware")))

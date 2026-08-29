@@ -13,9 +13,6 @@ static app_hooks_t H;
 #define T_LOCKED_HINT  1400
 #define T_PAIR_BOUND   2500
 #define T_SYNC_DONE    2200
-#define BATTERY_CRITICAL_PERCENT 3
-#define BATTERY_RECORD_MIN_PERCENT 5
-#define BATTERY_RECOVER_PERCENT 8
 
 const app_state_t *app_state_get(void) { return &S; }
 
@@ -98,11 +95,6 @@ static void start_rec(const char *title) {
     return;
   }
   if (S.mode != APP_MODE_STANDBY) return;
-  if (S.battery_low_latched || S.battery < BATTERY_RECORD_MIN_PERCENT) {
-    enter_error(APP_ERR_LOW_BATTERY, false);
-    return;
-  }
-
   S.mode = APP_MODE_STARTING;
   S.error = APP_ERR_NONE;
   S.close_reason = APP_CLOSE_USER;
@@ -196,11 +188,6 @@ static void short_press(char key) {
   if (S.mode == APP_MODE_STARTING || S.mode == APP_MODE_CLOSING ||
       S.mode == APP_MODE_ENDING) return;
   if (S.mode == APP_MODE_STORAGE_ERROR) {
-    if (S.error == APP_ERR_STORAGE_FORMAT_REQUIRED ||
-        S.error == APP_ERR_STORAGE_FORMATTING ||
-        S.error == APP_ERR_STORAGE_FORMAT_FAILED) {
-      return;
-    }
     if (S.storage_settled && (key == 'R' || key == 'B')) {
       S.mode = S.pairing == APP_PAIR_CLAIM_PENDING
                  ? APP_MODE_PAIRING : APP_MODE_STANDBY;
@@ -341,22 +328,8 @@ static void short_press(char key) {
 }
 
 static void long_press(char key) {
-  if (S.mode == APP_MODE_STORAGE_ERROR) {
-    if (S.error == APP_ERR_STORAGE_FORMAT_REQUIRED && key == 'R') {
-      S.error = APP_ERR_STORAGE_FORMATTING;
-      S.storage_settled = false;
-      CALL(render, APP_RENDER_FAST);
-      bool started = H.storage_format && H.storage_format();
-      if (!started) {
-        S.error = APP_ERR_STORAGE_FORMAT_FAILED;
-        S.storage_settled = true;
-        CALL(render, APP_RENDER_FAST);
-      }
-    }
-    return;
-  }
   if (S.mode == APP_MODE_STARTING || S.mode == APP_MODE_CLOSING ||
-      S.mode == APP_MODE_ENDING) return;
+      S.mode == APP_MODE_ENDING || S.mode == APP_MODE_STORAGE_ERROR) return;
   if (S.overlay == APP_OV_TODO_LISTEN || S.overlay == APP_OV_TODO_OK ||
       S.overlay == APP_OV_TODO_CONFIRM ||
       S.overlay == APP_OV_TODO_CREATED || S.overlay == APP_OV_TODO_FAILED ||
@@ -414,6 +387,10 @@ static void long_press(char key) {
   }
   if (S.mode == APP_MODE_RECORDING) {
     if (key == 'R') begin_close(APP_CLOSE_USER);
+    /* Long MARK used to switch to the rolling-minutes page.  Server V0.21.0
+       deliberately removed rolling minutes; keep this gesture inert so it
+       cannot disturb the live-caption page. */
+    else if (key == 'M') return;
     else if (key == 'B') {
       S.locked = true;
       S.overlay = APP_OV_NONE;
@@ -424,10 +401,6 @@ static void long_press(char key) {
 
 static void todo_hold(void) {
   if (S.mode != APP_MODE_STANDBY) return;
-  if (S.battery_low_latched || S.battery < BATTERY_RECORD_MIN_PERCENT) {
-    enter_error(APP_ERR_LOW_BATTERY, false);
-    return;
-  }
   if (S.overlay == APP_OV_REMINDER || S.overlay == APP_OV_POWER_CONFIRM) return;
   if (S.locked) {
     show_locked_hint();
@@ -577,10 +550,6 @@ void app_state_handle(app_event_t event, int32_t arg) {
         S.storage_settled = false;
       } else if (S.mode == APP_MODE_STORAGE_ERROR && !S.storage_settled) {
         S.error = (app_error_t)arg;
-      } else if (S.mode == APP_MODE_STANDBY &&
-                 (arg == APP_ERR_STORAGE_FORMAT_REQUIRED ||
-                  arg == APP_ERR_STORAGE_FORMAT_FAILED)) {
-        enter_error((app_error_t)arg, false);
       }
       break;
     case APP_EV_NET_CHANGE:
@@ -615,28 +584,35 @@ void app_state_handle(app_event_t event, int32_t arg) {
       break;
     case APP_EV_CHARGE_CHANGE:
       if (S.charging != (app_charge_t)arg) {
+        app_charge_t previous_charging = S.charging;
         S.charging = (app_charge_t)arg;
-        if (S.charging != APP_CHG_NONE) S.battery_low_latched = false;
-        if (S.mode == APP_MODE_STANDBY) CALL(render, APP_RENDER_FAST);
+        if (S.mode == APP_MODE_STANDBY &&
+            !(previous_charging == APP_CHG_CHARGING &&
+              S.charging == APP_CHG_FULL)) {
+          CALL(render, APP_RENDER_FAST);
+        }
       }
       break;
     case APP_EV_BATTERY:
       {
       uint8_t previous_battery = S.battery;
       S.battery = (uint8_t)(arg < 0 ? 0 : (arg > 100 ? 100 : arg));
-      if (S.charging != APP_CHG_NONE || S.battery >= BATTERY_RECOVER_PERCENT) {
-        S.battery_low_latched = false;
-      } else if (S.battery <= BATTERY_RECORD_MIN_PERCENT) {
-        S.battery_low_latched = true;
-      }
-      if (S.mode == APP_MODE_RECORDING &&
-          S.battery <= BATTERY_CRITICAL_PERCENT) {
-        begin_close(APP_CLOSE_LOW_BATTERY);
-      }
-      if (S.battery != previous_battery && status_page_visible()) {
-        CALL(render, APP_RENDER_STATUS_PARTIAL);
+      if (S.battery != previous_battery) {
+        bool charging_page = S.mode == APP_MODE_STANDBY &&
+                             S.overlay == APP_OV_NONE && S.page == 0 &&
+                             S.charging != APP_CHG_NONE;
+        if (charging_page && S.battery / 5U != previous_battery / 5U) {
+          CALL(render, APP_RENDER_FAST);
+        } else if (status_page_visible()) {
+          CALL(render, APP_RENDER_STATUS_PARTIAL);
+        }
       }
       }
+      break;
+    case APP_EV_BATTERY_CRITICAL:
+      /* Percentage is a user-facing estimate and never blocks a feature.
+         Only a debounced physical-voltage emergency may close an active WAV. */
+      if (S.mode == APP_MODE_RECORDING) begin_close(APP_CLOSE_LOW_BATTERY);
       break;
     case APP_EV_SD_LOW:
       if (S.sd_low != (bool)arg) {

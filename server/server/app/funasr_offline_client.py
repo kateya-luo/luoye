@@ -25,6 +25,7 @@ import re
 from contextlib import suppress
 
 import websockets
+import httpx
 
 from .segments import Segment
 
@@ -61,6 +62,9 @@ class FunASROfflineClient:
         self.feed_chunk_ms = int(os.getenv("OFFLINE_FEED_CHUNK_MS", "1000"))
         self.feed_pace_ms = int(os.getenv("OFFLINE_FEED_PACE_MS", "40"))   # 每块间隔，避免灌爆服务器输入缓冲
         self.idle_timeout = float(os.getenv("OFFLINE_IDLE_TIMEOUT", "30")) # 喂完后等结果/结果间静默多久算结束
+        self.http_url = os.getenv("FUNASR_OFFLINE_HTTP_URL", "").strip().rstrip("/")
+        self.http_preview_timeout = float(os.getenv("OFFLINE_HTTP_PREVIEW_TIMEOUT", "900"))
+        self.http_finalize_timeout = float(os.getenv("OFFLINE_HTTP_FINALIZE_TIMEOUT", "7200"))
 
     async def transcribe(self, pcm: bytes, base_offset_ms: int) -> list[Segment]:
         """转写一段 16k/16bit/mono PCM，返回带绝对会议时间偏移的分段（speaker 暂为局部/None）。"""
@@ -70,6 +74,8 @@ class FunASROfflineClient:
                             text="（离线转写占位）", source="offline", state="final")]
         if not pcm:
             return []
+        if self.http_url:
+            return await self._transcribe_http(pcm, base_offset_ms)
 
         total_ms = int(len(pcm) / BYTES_PER_MS)
         texts: list[str] = []   # 累积离线服务返回的整段文字
@@ -122,6 +128,55 @@ class FunASROfflineClient:
         segments = self._text_to_segments("".join(texts), base_offset_ms, total_ms)
         logger.info("offline_transcribe_done base=%d dur_ms=%d segments=%d", base_offset_ms, total_ms, len(segments))
         return segments
+
+    async def _transcribe_http(self, pcm: bytes, base_offset_ms: int) -> list[Segment]:
+        timeout = httpx.Timeout(
+            connect=30, read=self.http_preview_timeout,
+            write=self.http_preview_timeout, pool=30)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                self.http_url + "/transcribe",
+                content=pcm,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Base-Offset-Ms": str(max(0, int(base_offset_ms))),
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        segments = []
+        for item in payload.get("segments") or []:
+            text = str(item.get("text") or "").strip()
+            start_ms = max(0, int(item.get("start_ms") or 0))
+            end_ms = max(start_ms, int(item.get("end_ms") or start_ms))
+            if text and end_ms > start_ms:
+                segments.append(Segment(
+                    start_ms=start_ms, end_ms=end_ms, text=text,
+                    source="offline", state="final"))
+        logger.info("offline_http_transcribe_done base=%d segments=%d",
+                    base_offset_ms, len(segments))
+        return segments
+
+    async def finalize(self, session_id: str, canonical_sha256: str | None = None) -> dict:
+        if not self.http_url:
+            raise RuntimeError("FUNASR_OFFLINE_HTTP_URL is required for canonical finalization")
+        timeout = httpx.Timeout(
+            connect=30, read=self.http_finalize_timeout,
+            write=60, pool=30)
+        body = {"session_id": session_id}
+        if canonical_sha256:
+            body["canonical_sha256"] = canonical_sha256
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(self.http_url + "/finalize", json=body)
+            response.raise_for_status()
+            payload = response.json()
+        if not payload.get("segments"):
+            raise RuntimeError("canonical finalizer returned no segments")
+        logger.info(
+            "offline_canonical_received session_id=%s segments=%d speakers=%d rtf=%s",
+            session_id, len(payload["segments"]), int(payload.get("speaker_count") or 0),
+            payload.get("realtime_factor"))
+        return payload
 
     def _text_to_segments(self, text: str, base_offset_ms: int, total_ms: int) -> list[Segment]:
         """把整段离线文字按句末标点切句，按字数比例均匀铺到 [0,total_ms] 上。

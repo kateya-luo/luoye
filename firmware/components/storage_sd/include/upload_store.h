@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "esp_err.h"
 
@@ -24,21 +23,15 @@ typedef struct {
   char scene[16];
   char title[48];
   char state[24];
-  /* live = per-session realtime chunks; bulk/repair = API/2 byte ranges. */
+  /* live = 160 KiB realtime chunks; bulk/repair = API/2 byte ranges. */
   char upload_mode[8];
   uint32_t binding_generation;
   uint32_t next_seq;
-  uint32_t live_chunk_bytes;
   uint32_t acknowledged_bytes;
   uint32_t gap_start_bytes;
   uint32_t pcm_bytes;
   uint32_t retry_count;
   uint32_t result_revision;
-  uint32_t display_revision;
-  uint32_t caption_revision;
-  uint32_t speaker_revision;
-  uint32_t translation_revision;
-  uint32_t summary_revision;
   uint32_t result_pcm_bytes;
   int64_t started_at_utc;
   int64_t ended_at_utc;
@@ -51,16 +44,6 @@ typedef struct {
   bool deferred_gaps;
   bool defer_acked;
 } sd_upload_item_t;
-
-/* One sequential reader is retained for the active live session.  Keeping the
- * descriptor open avoids an O(file-size) FAT-chain walk for every one-second
- * chunk when FastSeek is unavailable.  The reader never owns the recorder's
- * write handle and must be closed before local deletion or range repair. */
-typedef struct {
-  FILE *file;
-  char session_id[SD_UPLOAD_SESSION_ID_BYTES];
-  uint32_t file_offset;
-} sd_upload_reader_t;
 
 typedef struct {
   char session_id[SD_UPLOAD_SESSION_ID_BYTES];
@@ -81,19 +64,10 @@ esp_err_t sd_upload_find(uint32_t binding_generation,
 esp_err_t sd_upload_next(uint32_t binding_generation, sd_upload_item_t *out);
 /* Returns the active recording at its last fsync-confirmed PCM boundary. */
 esp_err_t sd_upload_current(uint32_t binding_generation, sd_upload_item_t *out);
-/* Refresh only the recorder-owned durable watermark and close metadata of an
- * already loaded active item.  Upload cursors held in RAM are not overwritten
- * by an older upload.state checkpoint. */
-esp_err_t sd_upload_refresh_current(sd_upload_item_t *item);
 esp_err_t sd_upload_backlog(uint32_t *session_count, uint64_t *pending_bytes);
 esp_err_t sd_upload_read_audio(const sd_upload_item_t *item,
                                uint32_t offset, void *buffer,
                                size_t wanted, size_t *received);
-esp_err_t sd_upload_reader_read(sd_upload_reader_t *reader,
-                                const sd_upload_item_t *item,
-                                uint32_t offset, void *buffer,
-                                size_t wanted, size_t *received);
-void sd_upload_reader_close(sd_upload_reader_t *reader);
 /* Returns a recorder-generated digest for an exact durable 10 MiB range (or
  * the final short range). Older/recovered sessions may not have this index;
  * callers must fall back to scanning audio.wav on ESP_ERR_NOT_FOUND. */

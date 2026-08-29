@@ -88,6 +88,7 @@ class TestAccountIsolation(unittest.TestCase):
     def test_meeting_list_detail_export_delete_and_audio_are_isolated(self):
         self.storage.create_meeting("meeting-a", owner_user_id="TEST1")
         self.storage.save_transcript("meeting-a", ["TEST1 的内容"])
+        self.storage.set_title("meeting-a", "设备方案：评审会", "TEST1")
         self.storage.create_meeting("meeting-b", owner_user_id="TEST2")
         self.storage.save_transcript("meeting-b", ["TEST2 的内容"])
         audio = Path(self.temp) / "audio_cache" / "meeting-a.b.pcm"
@@ -102,6 +103,10 @@ class TestAccountIsolation(unittest.TestCase):
                          ["meeting-b"])
         self.assertEqual(self.client.get("/api/v1/meetings/meeting-a", headers=h2).status_code, 404)
         self.assertEqual(self.client.get("/api/v1/meetings/meeting-a/export", headers=h2).status_code, 404)
+        own_export = self.client.get("/api/v1/meetings/meeting-a/export", headers=h1)
+        self.assertEqual(own_export.status_code, 200)
+        self.assertIn("filename*=UTF-8''%E8%AE%BE%E5%A4%87%E6%96%B9%E6%A1%88-%E8%AF%84%E5%AE%A1%E4%BC%9A.md",
+                      own_export.headers["content-disposition"])
         self.assertEqual(self.client.get(f"/api/v1/meetings/meeting-a/audio?token={token2}").status_code, 401)
         self.assertEqual(self.client.get("/api/v1/meetings/meeting-a/audio", headers=h2).status_code, 404)
         self.assertEqual(self.client.delete("/api/v1/meetings/meeting-a", headers=h2).status_code, 404)

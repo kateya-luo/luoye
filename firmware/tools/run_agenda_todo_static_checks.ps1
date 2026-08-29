@@ -54,7 +54,7 @@ foreach ($required in @('agenda_snapshot_get', '02_agenda', $unscheduled,
                          'layout_draw_field(page, "next_label", next_time)',
                          'layout_draw_field(page, "next_event", next_content)',
                          'APP_OV_TODO_CONFIRM', 'epd_frame_fast(s_fb)',
-                         'event=page_transition_upgrade',
+                         'epd_frame_partial_window(s_fb, 4, 8, 192, 171)',
                          'epd_frame_full(s_fb)')) {
     if ($ui -notmatch [regex]::Escape($required)) {
         throw "Agenda/todo UI or FAST refresh policy is missing: $required"

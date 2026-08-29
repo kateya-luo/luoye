@@ -1,15 +1,11 @@
 import React, {useEffect, useRef, useState} from 'react';
 import CaptionStream from './CaptionStream';
-import MindMap from './MindMap';
-import {RollingMinutes, SummaryAside} from './MeetingPanels';
-import {buildChapters, countWords, chapterCount, formatClock} from './summaryDerive';
+import {formatClock} from './summaryDerive';
 import {buildSpeakerDirectory} from './speakers';
-import {IconCaptions, IconMinutes, IconMindmap, IconBack, IconSignal} from './icons';
+import {IconCaptions, IconBack, IconSignal} from './icons';
 
 const SUBTABS = [
   {id: 'captions', label: '字幕', icon: <IconCaptions />},
-  {id: 'minutes', label: '纪要', icon: <IconMinutes />},
-  {id: 'mindmap', label: '导图', icon: <IconMindmap />},
 ];
 
 const emptyResult = {
@@ -73,14 +69,12 @@ export default function ObserverView({sessionId, sessionInfo, token, onBack, emb
     if (msg.type === 'observer_catchup') {
       const segs = msg.segments || [];
       setLines(segs.map((s) => ({
-        seg_id: s.seg_id,
         text: s.text,
         ts: formatClock((s.start_ms || 0) / 1000),
         startMs: s.start_ms ?? null,
         speakerId: s.speaker_id,
         speakerLabel: s.speaker_label,
       })));
-      setPartial(msg.partial?.active ? (msg.partial.text || '') : '');
       if (msg.summary) applyResult({result: msg.summary}, false);
     }
     if (msg.type === 'asr_result') {
@@ -101,22 +95,12 @@ export default function ObserverView({sessionId, sessionInfo, token, onBack, emb
         setPartial('');
         setPartialSpeaker(null);
       } else {
-        setPartial((cur) => msg.partial_replace ? (msg.text || '') : `${cur}${msg.text}`);
+        setPartial((cur) => `${cur}${msg.text}`);
         setPartialSpeaker(msg.speaker_id || null);
       }
     }
-    if (msg.type === 'segment_update' && msg.seg_id) {
-      setLines((cur) => cur.map((line) => line.seg_id === msg.seg_id ? {
-        ...line,
-        speakerId: msg.speaker_id,
-        speakerLabel: msg.speaker_label,
-      } : line));
-    }
-    if (msg.type === 'meeting_update' || msg.type === 'meeting_result') {
-      applyResult(msg, true);
-      if (msg.type === 'meeting_result' && (msg.final || msg.summary_stage === 'final')) {
-        onEnded?.();
-      }
+    if (msg.type === 'meeting_result' && msg.final) {
+      onEnded?.();
     }
     if (msg.type === 'error') onUnavailable?.(msg);
   };
@@ -146,8 +130,6 @@ export default function ObserverView({sessionId, sessionInfo, token, onBack, emb
 
   const directory = buildSpeakerDirectory({speakers: result.speakers, speakerRoles: result.speaker_roles});
   const rolesById = new Map([...directory.values()].map((d) => [d.speakerId, d.roleLabel]));
-  const chapters = buildChapters(result, startedAt, elapsedSec);
-  const stats = {chapters: chapterCount(result), words: countWords(lines), duration: formatClock(elapsedSec)};
 
   return (
     <div className={`app-root observer-view${embedded ? ' embedded' : ''}`} style={{height: '100%', display: 'flex', flexDirection: 'column'}}>
@@ -194,28 +176,6 @@ export default function ObserverView({sessionId, sessionInfo, token, onBack, emb
           </div>
         )}
 
-        {subtab === 'minutes' && (
-          <div style={{padding: '0 0 16px'}}>
-            <section className="panel">
-              <div className="panel-head">
-                <h2>滚动纪要</h2>
-                {updatedAt && <span className="meta">更新于 {updatedAt}</span>}
-              </div>
-              <div className="panel-body">
-                <RollingMinutes chapters={chapters} summary={result.summary} />
-              </div>
-            </section>
-          </div>
-        )}
-
-        {subtab === 'mindmap' && (
-          <section className="panel" style={{height: 480, overflow: 'hidden'}}>
-            <div className="panel-head"><h2>思维导图</h2></div>
-            <div style={{flex: 1, minHeight: 0}}>
-              <MindMap value={result.mindmap} />
-            </div>
-          </section>
-        )}
       </div>
     </div>
   );

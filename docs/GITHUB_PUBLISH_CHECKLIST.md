@@ -37,14 +37,14 @@ git commit -m "chore: prepare luoye monorepo baseline"
 
 本地 `.github-release-assets/` 已被忽略。建议建立两个 GitHub Release：
 
-- `firmware-v2.3.2`：上传固件烧录包及对应 SHA-256。
-- `server-v1.0.1`：上传服务器发布包及对应 SHA-256。
+- `firmware-v1.7.0`：上传固件 flash、symbols 及对应 SHA-256。
+- `server-v0.21.0`：上传服务器 R9 发布包及对应 SHA-256。
 
 不要把压缩包直接提交进 Git 历史。
 
-当前 `luoye-fw-v2.3.2-engineering-live-io-r1` 包的内部清单标记为
-`git_dirty=true`，因此只应作为 Engineering/Pre-release 测试包。正式稳定版应在单仓提交并打好标签后，从干净工作树重新编译、打包，再确认清单中的
-`git_clean=true`、源码提交号、版本号和 SHA-256。
+当前 `luoye-fw-v1.7.0-engineering-sdspi-exact-dma-r2` 包来自干净源码提交，
+清单中的 `git_clean=true`，关键源码哈希、版本号和烧录镜像 SHA-256 均已核验。
+在完成真机长录音和中断续传验收前，仍应作为 Engineering/Pre-release 发布。
 
 ## 6. 干净环境复验
 

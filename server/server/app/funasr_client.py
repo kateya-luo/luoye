@@ -72,23 +72,6 @@ class FunASRClient:
         await asyncio.sleep(0)
         return self._drain_results()
 
-    async def collect_results(self, timeout: float = 0.0) -> list[dict]:
-        """Collect results for device workers without changing WebSocket clients.
-
-        Device HTTP uploads are acknowledged before this wait.  A short wait
-        here lets the background consumer publish a 2-pass online hypothesis
-        as soon as FunASR produces it instead of deferring it to the next PCM
-        chunk.
-        """
-        collected = self._drain_results()
-        if self.mock or collected or timeout <= 0:
-            return collected
-        try:
-            collected.append(await asyncio.wait_for(self.results.get(), timeout=timeout))
-        except asyncio.TimeoutError:
-            pass
-        return collected
-
     async def finish(self) -> list[dict]:
         if self.mock:
             return []
@@ -134,22 +117,13 @@ class FunASRClient:
                     continue
                 mode = message.get("mode", "online")
                 is_final = mode in {"offline", "2pass-offline"} or bool(message.get("is_final"))
-                logger.info("asr_msg mode=%s final=%s chars=%d bytes=%d",
-                            mode, is_final, len(text), len(text.encode("utf-8")))
+                logger.info("asr_msg mode=%s final=%s len=%d text=%s", mode, is_final, len(text), text[:24])
                 if is_final:
                     self.online_parts.clear()
-                    partial_text = ""
                 else:
-                    # This FunASR runtime emits 2pass-online as consecutive
-                    # fragments, not as a complete mutable hypothesis.  Keep
-                    # the raw fragment in `text` for existing browser clients,
-                    # and expose the accumulated utterance separately for the
-                    # recorder-card snapshot/polling protocol.
                     self.online_parts.append(text)
-                    partial_text = "".join(self.online_parts)
                 await self.results.put({
                     "text": text,
-                    "partial_text": partial_text,
                     "mode": mode,
                     "is_final": is_final,
                     "language": message.get("language") or self.language,

@@ -1,8 +1,7 @@
 // ui_render.h — state snapshot -> approved 200x200 UI -> SSD1681.
 // Clock/status fields use SSD1681 partial windows. Every visual page transition
-// uses FAST. V2.2 recording uses one page: a latest-suffix one-line ticker over
-// two timeline summary rows updated only by the minute FAST refresh; protocol
-// final/partial state remains invisible.
+// uses FAST. The active recording body uses a window PARTIAL every 5 seconds
+// and a whole-panel FAST every 5 minutes. Home uses FULL at 00/30.
 #pragma once
 #include "app_state.h"
 #include "esp_err.h"

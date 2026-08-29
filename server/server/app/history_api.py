@@ -1,5 +1,8 @@
+import re
 import struct
+import unicodedata
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
@@ -23,6 +26,20 @@ class TitleUpdate(BaseModel):
     title: str
 
 
+def _meeting_export_name(meeting: dict, extension: str) -> str:
+    summary = meeting.get("summary") if isinstance(meeting.get("summary"), dict) else {}
+    title = (meeting.get("title") or summary.get("title")
+             or (summary.get("mindmap") or {}).get("title")
+             or summary.get("summary") or "未命名会议")
+    title = unicodedata.normalize("NFKC", str(title))
+    title = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "-", title)
+    title = re.sub(r"\s+", " ", title).strip().rstrip(". ") or "未命名会议"
+    if re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])", title):
+        title += "-会议"
+    filename = f'{title[:80]}.{extension}'
+    return f'attachment; filename="meeting.{extension}"; filename*=UTF-8\'\'{quote(filename, safe="")}'
+
+
 def create_history_router(storage: Storage, *, prefix: str = "/api/v1/meetings") -> APIRouter:
     router = APIRouter(prefix=prefix, tags=["meetings"])
 
@@ -36,6 +53,15 @@ def create_history_router(storage: Storage, *, prefix: str = "/api/v1/meetings")
         if meeting is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会议不存在")
         return meeting
+
+    @router.get("/{session_id}/processing")
+    async def get_processing(session_id: str, user: CurrentUser = Depends(require_auth)):
+        if not storage.user_owns_meeting(session_id, user.id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会议不存在")
+        processing = storage.get_processing_status(session_id)
+        if processing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会议不存在")
+        return processing
 
     @router.delete("/{session_id}")
     async def delete_meeting(session_id: str, user: CurrentUser = Depends(require_auth)):
@@ -87,6 +113,9 @@ def create_history_router(storage: Storage, *, prefix: str = "/api/v1/meetings")
         format: str = Query(default="markdown", pattern="^(markdown|txt|json)$"),
         user: CurrentUser = Depends(require_auth),
     ):
+        meeting = storage.get_meeting(session_id, user.id)
+        if meeting is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会议不存在")
         exported = storage.export_meeting(session_id, format, user.id)
         if exported is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会议不存在")
@@ -94,7 +123,7 @@ def create_history_router(storage: Storage, *, prefix: str = "/api/v1/meetings")
         return Response(
             content=content,
             media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="meeting-{session_id}.{extension}"'},
+            headers={"Content-Disposition": _meeting_export_name(meeting, extension)},
         )
 
     return router

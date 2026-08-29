@@ -46,9 +46,8 @@ typedef enum {
  * coalesces requests by keeping the numerically highest pending kind. */
 typedef enum {
   APP_RENDER_CLOCK_PARTIAL = 0,
-  APP_RENDER_RECORD_HEADER_PARTIAL,
-  APP_RENDER_RECORD_LIVE_PARTIAL,    /* one-line live ticker */
   APP_RENDER_STATUS_PARTIAL,
+  APP_RENDER_PARTIAL,       /* active-recording body window */
   APP_RENDER_FAST,
   APP_RENDER_FULL,
 } app_render_t;
@@ -88,9 +87,6 @@ typedef enum {
   APP_ERR_LOW_BATTERY,
   APP_ERR_RECOVERY,
   APP_ERR_BUSY,
-  APP_ERR_STORAGE_FORMAT_REQUIRED,
-  APP_ERR_STORAGE_FORMATTING,
-  APP_ERR_STORAGE_FORMAT_FAILED,
 } app_error_t;
 
 typedef enum {
@@ -115,6 +111,7 @@ typedef enum {
   APP_EV_PAIRING_CHANGE,
   APP_EV_CHARGE_CHANGE,
   APP_EV_BATTERY,
+  APP_EV_BATTERY_CRITICAL,
   APP_EV_SD_LOW,
   APP_EV_BACKLOG,
   APP_EV_AGENDA_CHANGE,
@@ -137,7 +134,6 @@ typedef struct {
   bool paused, locked, online, cloud_online, sd_low;
   bool storage_settled;
   bool reminder_pending;
-  bool battery_low_latched;
   int8_t todo_result_pending;
   app_pair_state_t pairing;
   app_sync_state_t sync;
@@ -164,7 +160,6 @@ typedef struct {
   bool (*todo_action)(bool confirm);
   bool (*sync_request)(void);
   bool (*agenda_sync_request)(void);
-  bool (*storage_format)(void);
   void (*reminder_action)(app_reminder_action_t action);
   void (*enter_pairing)(void);
   void (*exit_pairing)(void);

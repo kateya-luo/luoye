@@ -4,7 +4,7 @@ param(
     [string]$Profile = 'engineering',
     [switch]$FullClean,
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'http://clearmeeting.chat:34567',
+    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
     [switch]$AllowInsecureHttp
 )
 
@@ -21,12 +21,7 @@ if (-not (Test-Path -LiteralPath $idfPy)) {
 }
 $idfVersion = (& python $idfPy --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $idfVersion -notmatch 'v5\.5\.4') {
-    throw "Luoye v2.3.2 requires ESP-IDF v5.5.4; detected: $idfVersion"
-}
-
-& (Join-Path $PSScriptRoot 'apply_idf_v554_spi_oom_guard.ps1') -IdfPath $env:IDF_PATH
-if ($LASTEXITCODE -ne 0) {
-    throw "ESP-IDF v5.5.4 DMA patch failed: $LASTEXITCODE"
+    throw "Luoye v1.7.0 requires ESP-IDF v5.5.4; detected: $idfVersion"
 }
 
 if ($ServerBaseUrl.StartsWith('http://')) {
@@ -40,7 +35,7 @@ if ($ServerBaseUrl.StartsWith('http://')) {
 $allowHttpValue = if ($AllowInsecureHttp) { 'ON' } else { 'OFF' }
 
 if ($Profile -eq 'engineering') {
-    $buildDir = Join-Path $project 'build-v232'
+    $buildDir = Join-Path $project 'build-v170'
     $sdkconfigPath = Join-Path $project 'sdkconfig.ui154'
     $defaults = 'sdkconfig.defaults'
 } else {
@@ -76,11 +71,27 @@ try {
 
     $description = Get-Content -LiteralPath (Join-Path $buildDir 'project_description.json') -Raw |
         ConvertFrom-Json
-    if ($description.project_version -ne '2.3.2') {
+    if ($description.project_version -ne '1.7.0') {
         throw "Embedded version mismatch: $($description.project_version)"
     }
     if ($description.target -ne 'esp32s3') {
         throw "Target mismatch: $($description.target)"
+    }
+    $expectedSdspi = [IO.Path]::GetFullPath(
+        (Join-Path $project 'components\esp_driver_sdspi'))
+    $actualSdspi = @($description.build_component_paths | Where-Object {
+        $_ -and [IO.Path]::GetFullPath([string]$_) -eq $expectedSdspi
+    })
+    if ($actualSdspi.Count -ne 1) {
+        throw 'Project-local esp_driver_sdspi override is not active.'
+    }
+    $expectedSpi = [IO.Path]::GetFullPath(
+        (Join-Path $project 'components\esp_driver_spi'))
+    $actualSpi = @($description.build_component_paths | Where-Object {
+        $_ -and [IO.Path]::GetFullPath([string]$_) -eq $expectedSpi
+    })
+    if ($actualSpi.Count -ne 1) {
+        throw 'Project-local esp_driver_spi override is not active.'
     }
 
     [pscustomobject]@{

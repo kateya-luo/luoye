@@ -50,8 +50,7 @@ export function RollingMinutes({chapters, summary, onSeek}) {
     return (
       <div className="empty">
         <div className="e-ic"><IconMinutes /></div>
-        <div>{summary && summary !== '会议进行中，滚动纪要将在识别到完整语句后出现。'
-          ? summary : '识别到完整语句后，滚动纪要会在这里逐段生成'}</div>
+        <div>{summary || '会议结束且转写完整后，请选择模板生成会议纪要。'}</div>
       </div>
     );
   }
@@ -200,9 +199,9 @@ export function ControlAside({result, controls, updatedAt}) {
   );
 }
 
-// 纪要阶段标签：让用户一眼知道当前纪要处于哪个阶段（滚动→初稿→并入补录→最终版）
+// 旧版会议数据的兼容阶段标签。V0.21 录制期间不再生成纪要。
 const STAGE_TAGS = {
-  rolling: {label: '实时滚动', bg: '#3b82f6'},
+  rolling: {label: '旧版实时纪要', bg: '#3b82f6'},
   draft: {label: '初稿·定稿中', bg: '#f59e0b'},
   gap_merged: {label: '已并入补录', bg: '#8b5cf6'},
   final: {label: '最终版', bg: '#10b981'},
@@ -226,7 +225,7 @@ export function SmartMinutes({result, chapters, updatedAt}) {
         </div>
         <div className="sm-inner-tabs">
           <button className={inner === 'summary' ? 'active' : ''} onClick={() => setInner('summary')}>智能纪要</button>
-          <button className={inner === 'rolling' ? 'active' : ''} onClick={() => setInner('rolling')}>滚动纪要</button>
+          <button className={inner === 'rolling' ? 'active' : ''} onClick={() => setInner('rolling')}>纪要要点</button>
         </div>
       </div>
       <div className="panel-body">
@@ -317,7 +316,7 @@ export function MeetingAssistAside({result, controls, stats, online, savedAt, sp
         </div>
         <div className="aside-sect">
           <p className="muted" style={{fontSize: 12.5, lineHeight: 1.75, margin: 0}}>
-            思维导图将在会议结束后自动生成，可在会议历史中查看。
+            录制过程中只进行实时转写。会议结束并完成离线整理后，可在历史记录中选择模板，一次性生成正式纪要。
           </p>
         </div>
       </div>

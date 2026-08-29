@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     language TEXT DEFAULT 'auto',
     summary_language TEXT DEFAULT 'auto',
     speakers_json TEXT,                         -- 会议级说话人摘要（延迟定稿/恢复时用）
+    speaker_diarization_enabled INTEGER NOT NULL DEFAULT 1,
     audio_end_ms INTEGER,                       -- final=1 时的音频总时长
     updated_at TEXT
 );
@@ -59,9 +60,6 @@ CREATE TABLE IF NOT EXISTS segments (
     source TEXT NOT NULL DEFAULT 'live',
     state TEXT NOT NULL DEFAULT 'provisional',
     revision INTEGER NOT NULL DEFAULT 1,
-    caption_revision INTEGER NOT NULL DEFAULT 0,
-    speaker_revision INTEGER NOT NULL DEFAULT 0,
-    translation_revision INTEGER NOT NULL DEFAULT 0,
     translation TEXT,                            -- 实时翻译译文（v2 翻译管道落库）
     PRIMARY KEY (session_id, seg_id)
 );
@@ -251,15 +249,6 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     expected_chunks INTEGER,
     expected_samples INTEGER,
     revision INTEGER NOT NULL DEFAULT 0,
-    caption_revision INTEGER NOT NULL DEFAULT 0,
-    speaker_revision INTEGER NOT NULL DEFAULT 0,
-    translation_revision INTEGER NOT NULL DEFAULT 0,
-    summary_revision INTEGER NOT NULL DEFAULT 0,
-    display_revision INTEGER NOT NULL DEFAULT 0,
-    partial_caption TEXT NOT NULL DEFAULT '',
-    partial_start_ms INTEGER NOT NULL DEFAULT 0,
-    partial_end_ms INTEGER NOT NULL DEFAULT 0,
-    partial_updated_at TEXT,
     failure_code TEXT,
     failure_message TEXT,
     created_at TEXT NOT NULL,
@@ -269,21 +258,6 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_device_sessions_owner ON device_sessions(owner_user_id, created_at DESC);
-CREATE TABLE IF NOT EXISTS device_display_events (
-    server_session_id TEXT NOT NULL,
-    display_revision INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    text TEXT NOT NULL DEFAULT '',
-    start_ms INTEGER NOT NULL DEFAULT 0,
-    end_ms INTEGER NOT NULL DEFAULT 0,
-    seg_id TEXT,
-    caption_revision INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY(server_session_id, display_revision),
-    FOREIGN KEY(server_session_id) REFERENCES device_sessions(server_session_id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_device_display_events_cursor
-ON device_display_events(server_session_id, display_revision);
 CREATE TABLE IF NOT EXISTS device_audio_chunks (
     server_session_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -343,6 +317,34 @@ CREATE INDEX IF NOT EXISTS idx_offline_asr_jobs_claim
     ON offline_asr_jobs(state, available_at, order_key, session_id, chunk_index, id);
 CREATE INDEX IF NOT EXISTS idx_offline_asr_jobs_session
     ON offline_asr_jobs(session_id, state, reason);
+CREATE TABLE IF NOT EXISTS canonical_diarization_runs (
+    session_id TEXT PRIMARY KEY,
+    canonical_sha256 TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    state TEXT NOT NULL,
+    segment_count INTEGER NOT NULL DEFAULT 0,
+    speaker_count INTEGER NOT NULL DEFAULT 0,
+    processing_ms INTEGER NOT NULL DEFAULT 0,
+    realtime_factor REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES device_sessions(server_session_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS meeting_canonical_runs (
+    session_id TEXT PRIMARY KEY,
+    canonical_sha256 TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    state TEXT NOT NULL,
+    segment_count INTEGER NOT NULL DEFAULT 0,
+    speaker_count INTEGER NOT NULL DEFAULT 0,
+    processing_ms INTEGER NOT NULL DEFAULT 0,
+    realtime_factor REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES meetings(session_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS device_session_marks (
     server_session_id TEXT NOT NULL,
     client_mark_id TEXT NOT NULL,
@@ -387,6 +389,168 @@ CREATE TABLE IF NOT EXISTS device_voice_todos (
     FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE RESTRICT,
     FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
+CREATE TABLE IF NOT EXISTS minutes_templates (
+    template_id TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    schema_json TEXT NOT NULL,
+    prompt_json TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(template_id, version)
+);
+CREATE TABLE IF NOT EXISTS minutes_jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    template_version INTEGER NOT NULL,
+    request_hash TEXT NOT NULL UNIQUE,
+    transcript_revision INTEGER NOT NULL DEFAULT 0,
+    speaker_revision INTEGER NOT NULL DEFAULT 0,
+    transcript_sha256 TEXT NOT NULL,
+    model TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES meetings(session_id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_minutes_jobs_session ON minutes_jobs(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS minutes_versions (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    template_version INTEGER NOT NULL,
+    transcript_revision INTEGER NOT NULL,
+    speaker_revision INTEGER NOT NULL,
+    transcript_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(job_id) REFERENCES minutes_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY(session_id) REFERENCES meetings(session_id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_minutes_versions_session ON minutes_versions(session_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_minutes_active_version
+    ON minutes_versions(session_id) WHERE active=1;
+CREATE TABLE IF NOT EXISTS people (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    role TEXT,
+    notes TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_people_owner ON people(owner_user_id, active, display_name);
+CREATE TABLE IF NOT EXISTS person_aliases (
+    id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'user',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    UNIQUE(owner_user_id, normalized_alias),
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS person_voiceprints (
+    id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 1,
+    quality REAL NOT NULL DEFAULT 0.0,
+    source_session_id TEXT,
+    source_speaker_id TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_voiceprints_owner ON person_voiceprints(owner_user_id, active);
+CREATE TABLE IF NOT EXISTS meeting_speaker_assignments (
+    session_id TEXT NOT NULL,
+    speaker_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    person_id TEXT,
+    display_name TEXT NOT NULL,
+    role TEXT,
+    match_confidence REAL,
+    match_mode TEXT NOT NULL DEFAULT 'manual',
+    remembered INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, speaker_id),
+    FOREIGN KEY(session_id) REFERENCES meetings(session_id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS lexicon_entries (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    canonical_text TEXT NOT NULL,
+    variants_json TEXT NOT NULL DEFAULT '[]',
+    kind TEXT NOT NULL DEFAULT 'term',
+    person_id TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_user_id, canonical_text, kind),
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    meeting_series_id TEXT,
+    source_session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    valid_from TEXT,
+    valid_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_session_id) REFERENCES meetings(session_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_memory_facts_owner ON memory_facts(owner_user_id, status, kind);
+CREATE TABLE IF NOT EXISTS action_register (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    external_key TEXT,
+    task TEXT NOT NULL,
+    assignee_person_id TEXT,
+    assignee_text TEXT,
+    due_at TEXT,
+    closure_standard TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_session_id) REFERENCES meetings(session_id) ON DELETE CASCADE,
+    FOREIGN KEY(assignee_person_id) REFERENCES people(id) ON DELETE SET NULL
+);
 """
 
 
@@ -411,6 +575,20 @@ class Database:
                 self._conn.execute("ALTER TABLE meetings ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'TEST1'")
             except sqlite3.OperationalError:
                 pass
+            for meeting_column in (
+                "ALTER TABLE meetings ADD COLUMN title TEXT",
+                "ALTER TABLE meetings ADD COLUMN summary_json TEXT",
+                "ALTER TABLE meetings ADD COLUMN language TEXT DEFAULT 'auto'",
+                "ALTER TABLE meetings ADD COLUMN summary_language TEXT DEFAULT 'auto'",
+                "ALTER TABLE meetings ADD COLUMN speakers_json TEXT",
+                "ALTER TABLE meetings ADD COLUMN speaker_diarization_enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE meetings ADD COLUMN audio_end_ms INTEGER",
+                "ALTER TABLE meetings ADD COLUMN updated_at TEXT",
+            ):
+                try:
+                    self._conn.execute(meeting_column)
+                except sqlite3.OperationalError:
+                    pass
             self._conn.execute("UPDATE meetings SET owner_user_id='TEST1' WHERE owner_user_id IS NULL OR owner_user_id='' ")
             self._conn.execute("UPDATE agenda_events SET owner='TEST1' WHERE owner IS NULL OR owner='' OR owner='default'")
             self._conn.execute("UPDATE agenda_todos SET owner='TEST1' WHERE owner IS NULL OR owner='' OR owner='default'")
@@ -427,18 +605,6 @@ class Database:
                 "ALTER TABLE device_sessions ADD COLUMN upload_mode TEXT NOT NULL DEFAULT 'live'",
                 "ALTER TABLE device_sessions ADD COLUMN canonical_total_bytes INTEGER",
                 "ALTER TABLE device_sessions ADD COLUMN canonical_sha256 TEXT",
-                "ALTER TABLE device_sessions ADD COLUMN display_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN caption_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN speaker_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN translation_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN summary_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN partial_caption TEXT NOT NULL DEFAULT ''",
-                "ALTER TABLE device_sessions ADD COLUMN partial_start_ms INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN partial_end_ms INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE device_sessions ADD COLUMN partial_updated_at TEXT",
-                "ALTER TABLE segments ADD COLUMN caption_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE segments ADD COLUMN speaker_revision INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE segments ADD COLUMN translation_revision INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE devices ADD COLUMN speaker_diarization_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE devices ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE device_sessions ADD COLUMN speaker_diarization_enabled INTEGER NOT NULL DEFAULT 1",
@@ -452,22 +618,17 @@ class Database:
                 "ALTER TABLE agenda_todos ADD COLUMN completed_at TEXT",
                 "ALTER TABLE agenda_todos ADD COLUMN created_at TEXT",
                 "ALTER TABLE agenda_todos ADD COLUMN updated_at TEXT",
+                "ALTER TABLE meetings ADD COLUMN transcript_revision INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE meetings ADD COLUMN speaker_revision INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE meetings ADD COLUMN minutes_status TEXT NOT NULL DEFAULT 'not_created'",
+                "ALTER TABLE meetings ADD COLUMN active_minutes_version_id TEXT",
+                "ALTER TABLE segments ADD COLUMN raw_text TEXT",
+                "ALTER TABLE segments ADD COLUMN person_id TEXT",
             ):
                 try:
                     self._conn.execute(column_sql)
                 except sqlite3.OperationalError:
                     pass
-            # V1.0.1 channel cursors use the historical global revision as an
-            # event stamp.  This preserves ordering for old rows without
-            # renumbering any recorder cursor.
-            self._conn.execute(
-                "UPDATE segments SET caption_revision=revision"
-                " WHERE caption_revision=0 AND text!=''")
-            self._conn.execute(
-                "UPDATE device_sessions SET caption_revision=COALESCE(("
-                " SELECT MAX(caption_revision) FROM segments"
-                " WHERE segments.session_id=device_sessions.server_session_id),0)"
-                " WHERE caption_revision=0")
             agenda_now = datetime.now(timezone.utc).isoformat()
             self._conn.execute(
                 "UPDATE agenda_todos SET created_at=COALESCE(created_at,?),"
@@ -475,6 +636,9 @@ class Database:
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_voice_todos_server_id"
                 " ON device_voice_todos(server_todo_id) WHERE server_todo_id IS NOT NULL")
+            self._conn.execute(
+                "UPDATE meetings SET minutes_status='ready' WHERE summary_json IS NOT NULL"
+                " AND minutes_status='not_created'")
             for row in self._conn.execute(
                     "SELECT device_id,client_todo_id FROM device_voice_todos"
                     " WHERE server_todo_id IS NULL OR server_todo_id='' ").fetchall():
@@ -550,13 +714,9 @@ def row_to_segment(row: sqlite3.Row) -> dict[str, Any]:
         "source": row["source"],
         "state": row["state"],
         "revision": row["revision"],
-        "caption_revision": (row["caption_revision"]
-                             if "caption_revision" in row.keys() else row["revision"]),
-        "speaker_revision": (row["speaker_revision"]
-                             if "speaker_revision" in row.keys() else 0),
-        "translation_revision": (row["translation_revision"]
-                                 if "translation_revision" in row.keys() else 0),
         "translation": row["translation"] if "translation" in row.keys() else None,
+        "raw_text": row["raw_text"] if "raw_text" in row.keys() else None,
+        "person_id": row["person_id"] if "person_id" in row.keys() else None,
     }
 
 

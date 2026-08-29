@@ -91,3 +91,42 @@ test('fixed SD management stays on the owner-scoped API/2 device routes', async 
     action: 'delete_sessions', session_ids: ['s-1'],
   });
 });
+
+test('idempotent GET requests recover from transient gateway errors', async () => {
+  const statuses = [502, 503, 200];
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({url, options});
+    const status = statuses.shift();
+    return jsonResponse(status === 200 ? {session_id: 'meeting-1'} : {}, status);
+  };
+
+  assert.equal((await api.getMeeting('meeting-1')).session_id, 'meeting-1');
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.url === '/api/v1/meetings/meeting-1'));
+});
+
+test('meeting background processing has a dedicated lightweight endpoint', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return jsonResponse({stage: 'transcribing', active: true, progress_percent: 58});
+  };
+  const status = await api.getMeetingProcessing('meeting / 1');
+  assert.equal(status.progress_percent, 58);
+  assert.deepEqual(calls, ['/api/v1/meetings/meeting%20%2F%201/processing']);
+});
+
+test('mutating requests are not automatically retried', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return jsonResponse({}, 502);
+  };
+
+  await assert.rejects(
+    () => api.createMinutesJob('meeting-1', '18'),
+    (error) => error.status === 502,
+  );
+  assert.equal(calls, 1);
+});

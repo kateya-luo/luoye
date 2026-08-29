@@ -4,9 +4,9 @@ param(
     [string]$Profile = 'engineering',
     [switch]$FullClean,
     [switch]$Package,
-    [string]$ReleaseId = 'luoye-fw-v2.3.2-engineering-live-io-r1',
+    [string]$ReleaseId = 'luoye-fw-v1.7.0-engineering-sdspi-exact-dma-r2',
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'http://clearmeeting.chat:34567',
+    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
     [switch]$AllowInsecureHttp
 )
 
@@ -35,6 +35,8 @@ if ($LASTEXITCODE -ne 0) { throw "Power-SOC calibration test failed: $LASTEXITCO
 if ($LASTEXITCODE -ne 0) { throw "Provisioning static checks failed: $LASTEXITCODE" }
 & (Join-Path $PSScriptRoot 'run_cloud_sync_static_checks.ps1')
 if ($LASTEXITCODE -ne 0) { throw "Cloud-sync static checks failed: $LASTEXITCODE" }
+& (Join-Path $PSScriptRoot 'run_sdspi_exact_dma_static_checks.ps1')
+if ($LASTEXITCODE -ne 0) { throw "SDSPI exact-wire DMA checks failed: $LASTEXITCODE" }
 & (Join-Path $PSScriptRoot 'run_live_ui_static_checks.ps1')
 if ($LASTEXITCODE -ne 0) { throw "Live AI/UI static checks failed: $LASTEXITCODE" }
 & (Join-Path $PSScriptRoot 'run_agenda_todo_static_checks.ps1')
@@ -57,11 +59,11 @@ $buildResult
 
 if ($Package) {
     & (Join-Path $PSScriptRoot 'package_firmware.ps1') `
-        -BuildDir $(if ($Profile -eq 'engineering') { 'build-v232' } else { "build-$Profile" }) `
+        -BuildDir $(if ($Profile -eq 'engineering') { 'build-v170' } else { "build-$Profile" }) `
         -ReleaseId $ReleaseId `
-        -ExpectedVersion '2.3.2' `
-        -ServerRelease '1.0.1' `
-        -MinimumClientVersion '1.0.0' `
+        -ExpectedVersion '1.7.0' `
+        -ServerRelease '0.21.0' `
+        -MinimumClientVersion '0.21.0' `
         -Profile $Profile `
         -ServerBaseUrl $ServerBaseUrl `
         -AllowInsecureHttp:$AllowInsecureHttp

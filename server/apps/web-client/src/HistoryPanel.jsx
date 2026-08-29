@@ -1,11 +1,17 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
-import {deleteMeeting, getMeeting, getMeetingAudio, listMeetings, updateMeetingTitle} from './api';
+import {
+  createMinutesJob, deleteMeeting, getMeeting, getMeetingAudio, getMinutesJob,
+  listMeetingSpeakers, listMeetings, listMinutesTemplates, listPeopleMemory,
+  updateMeetingSpeaker, updateMeetingTitle, confirmMeetingMemory,
+} from './api';
 import CaptionStream from './CaptionStream';
+import ProcessingProgress from './ProcessingProgress';
 import MindMap, {MindMapPreview} from './MindMap';
-import {RollingMinutes} from './MeetingPanels';
 import ExportDialog from './ExportDialog';
 import {keyConclusions, formatClock, buildChapters} from './summaryDerive';
 import {buildSpeakerDirectory} from './speakers';
+import {applyMinutesJobResponse} from './minutesJobUi.js';
+import {processingStatusLabel} from './processingStatus';
 import {
   durationLabel, durationSeconds, participantCount, meetingTags, meetingTitle, shortId, formatBytes,
 } from './meetingMeta';
@@ -43,15 +49,18 @@ function Tags({tags}) {
 /* ---------- list row ---------- */
 function MeetingRow({m, active, onOpen, onExport, onDelete, onSelect}) {
   const tags = meetingTags(m, m.session_id);
+  const processing = m.processing;
+  const statusClass = ['failed', 'stalled'].includes(processing?.stage) ? 'failed' : (processing?.active ? 'processing' : 'ok');
   return (
     <div className={`hrow ${active ? 'active' : ''}`} onClick={() => onSelect(m.session_id)}>
       <div className="hrow-main">
-        <div className="hrow-title"><span className="dot" /><strong>{meetingTitle(m)}</strong><span className="status ok">已完成</span></div>
+        <div className="hrow-title"><span className="dot" /><strong>{meetingTitle(m)}</strong><span className={`status ${statusClass}`}>{processingStatusLabel(processing)}</span></div>
         <div className="hrow-meta">
           <span><IconHistory /> {fmtDate(m.created_at)}</span>
           <span><IconMic /> 电脑麦克风（模拟录音笔）</span>
           <span>{m.segment_count} 段</span>
         </div>
+        <ProcessingProgress status={processing} compact />
         <Tags tags={tags} />
       </div>
       <div className="hrow-actions no-drag" onClick={(e) => e.stopPropagation()}>
@@ -80,6 +89,7 @@ function PreviewAside({meeting, onOpen, onClose}) {
           <span><IconHistory /> {dateRangeLabel(meeting)}</span>
           <span><IconMic /> 电脑麦克风（模拟录音笔）</span>
         </div>
+        <ProcessingProgress status={meeting.processing} />
         <Tags tags={tags} />
         <div className="aside-sect"><div className="sect-head"><IconClipboard /> 会议摘要</div><p className="muted" style={{lineHeight: 1.7, color: 'var(--ink-2)'}}>{s.summary || '暂无摘要'}</p></div>
         <div className="aside-sect"><div className="sect-head"><IconCheckCircle /> 关键结论</div>
@@ -97,9 +107,11 @@ function PreviewAside({meeting, onOpen, onClose}) {
 
 /* ---------- info column (detail) ---------- */
 function InfoColumn({meeting}) {
+  const processing = meeting.processing;
+  const statusClass = ['failed', 'stalled'].includes(processing?.stage) ? 'failed' : (processing?.active ? 'processing' : 'ok');
   const rows = [
     ['会议名称', meetingTitle(meeting)],
-    ['会议状态', <span className="status ok" key="s">已完成</span>],
+    ['会议状态', <span className={`status ${statusClass}`} key="s">{processingStatusLabel(processing)}</span>],
     ['会议时间', dateRangeLabel(meeting)],
     ['参会人数', `${participantCount(meeting)} 人`],
     ['录音来源', '电脑麦克风（模拟录音笔）'],
@@ -281,6 +293,141 @@ function InlineTitle({value, sessionId, onChange}) {
   );
 }
 
+function SpeakerMemoryEditor({meeting, onChanged}) {
+  const [speakers, setSpeakers] = useState([]);
+  const [people, setPeople] = useState([]);
+  const [drafts, setDrafts] = useState({});
+  const [message, setMessage] = useState('');
+  const load = async () => {
+    const [speakerPayload, peoplePayload] = await Promise.all([
+      listMeetingSpeakers(meeting.session_id), listPeopleMemory(),
+    ]);
+    setSpeakers(speakerPayload.speakers || []);
+    setPeople(peoplePayload.people || []);
+    setDrafts(Object.fromEntries((speakerPayload.speakers || []).map((s) => [s.speaker_id, {
+      display_name: s.display_name, role: s.role || '', person_id: s.person_id || '', remember: Boolean(s.remembered),
+    }])));
+  };
+  useEffect(() => { load().catch((e) => setMessage(e.message)); }, [meeting.session_id]);
+  const save = async (speakerId) => {
+    try {
+      const value = drafts[speakerId];
+      await updateMeetingSpeaker(meeting.session_id, speakerId, {...value, person_id: value.person_id || null});
+      setMessage('人员名称已保存；勾选“记住”后会用于以后会议的声纹匹配和同音字词典。');
+      await load();
+      onChanged?.();
+    } catch (e) { setMessage(e.message); }
+  };
+  return (
+    <section className="panel">
+      <div className="panel-head"><h2>参会人员校正</h2><span className="meta">{speakers.length} 人</span></div>
+      <div className="panel-body speaker-memory-list">
+        {speakers.map((speaker) => {
+          const value = drafts[speaker.speaker_id] || {};
+          return <div className="speaker-memory-row" key={speaker.speaker_id}>
+            <div className="speaker-memory-meta"><b>{speaker.speaker_id}</b><span>{speaker.segment_count} 段 · {Math.round(speaker.duration_ms / 1000)} 秒</span></div>
+            <input value={value.display_name || ''} onChange={(e) => setDrafts((d) => ({...d, [speaker.speaker_id]: {...value, display_name: e.target.value}}))} placeholder="姓名" />
+            <input value={value.role || ''} onChange={(e) => setDrafts((d) => ({...d, [speaker.speaker_id]: {...value, role: e.target.value}}))} placeholder="角色（可选）" />
+            <select value={value.person_id || ''} onChange={(e) => {
+              const person = people.find((p) => p.id === e.target.value);
+              setDrafts((d) => ({...d, [speaker.speaker_id]: {...value, person_id: e.target.value,
+                display_name: person?.display_name || value.display_name, role: person?.role || value.role}}));
+            }}>
+              <option value="">不关联已有人员</option>
+              {people.map((p) => <option key={p.id} value={p.id}>{p.display_name}{p.role ? ` · ${p.role}` : ''}</option>)}
+            </select>
+            <label className="remember-person"><input type="checkbox" checked={Boolean(value.remember)} onChange={(e) => setDrafts((d) => ({...d, [speaker.speaker_id]: {...value, remember: e.target.checked}}))} /> 记住此人</label>
+            <button className="btn primary" onClick={() => save(speaker.speaker_id)}>保存</button>
+            {speaker.match_mode === 'suggested' && <span className="memory-suggestion">声纹建议：{speaker.display_name}（{Math.round((speaker.match_confidence || 0) * 100)}%）</span>}
+          </div>;
+        })}
+        {!speakers.length && <p className="muted">本场会议暂未形成可编辑的说话人分组。</p>}
+        {message && <p className="muted">{message}</p>}
+      </div>
+    </section>
+  );
+}
+
+function TemplateMinutesPanel({meeting, onChanged, onMinutesReady}) {
+  const [templates, setTemplates] = useState([]);
+  const [selected, setSelected] = useState(meeting.summary?.template?.id || '01');
+  const [job, setJob] = useState(null);
+  const [error, setError] = useState('');
+  const [confirming, setConfirming] = useState(false);
+  const [showPicker, setShowPicker] = useState(false);
+  useEffect(() => { listMinutesTemplates().then((p) => setTemplates(p.templates || [])).catch((e) => setError(e.message)); }, []);
+  useEffect(() => {
+    if (meeting.summary?.template?.id) setSelected(meeting.summary.template.id);
+  }, [meeting.session_id, meeting.summary?.template?.id]);
+  useEffect(() => {
+    if (!job || !['queued', 'generating'].includes(job.state)) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const current = await getMinutesJob(job.id);
+        if (['ready', 'failed'].includes(current.state)) clearInterval(timer);
+        await applyMinutesJobResponse(current, {setJob, setShowPicker, onMinutesReady, onChanged, setError});
+      } catch (e) { setError(e.message); }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [job?.id, job?.state]);
+  const generate = async () => {
+    setError('');
+    try {
+      const current = await createMinutesJob(meeting.session_id, selected);
+      await applyMinutesJobResponse(current, {setJob, setShowPicker, onMinutesReady, onChanged, setError});
+    }
+    catch (e) { setError(e.message); }
+  };
+  const summary = meeting.summary || {};
+  const hasMinutes = meeting.minutes_status === 'ready'
+    && Boolean(summary.summary || summary.title || (summary.sections || []).length);
+  const grouped = templates.reduce((out, item) => ({...out, [item.category]: [...(out[item.category] || []), item]}), {});
+  const confirmCandidates = async () => {
+    setConfirming(true);
+    try {
+      await confirmMeetingMemory(meeting.session_id, (summary.memory_candidates || []).filter((c) => !c.confirmed));
+      setError('已把候选内容存入会议记忆。');
+    } catch (e) { setError(e.message); }
+    finally { setConfirming(false); }
+  };
+  if (!hasMinutes || showPicker) return (
+    <section className="panel template-picker-panel">
+      <div className="panel-head"><h2>生成会议纪要</h2><span className="meta">点击后才会调用 DeepSeek 一次</span></div>
+      <div className="panel-body">
+        <p className="muted">完整转写已经保存。先校正人员姓名，再选择最符合会议目的的模板。</p>
+        {Object.entries(grouped).map(([category, items]) => <div className="template-group" key={category}>
+          <h3>{category}</h3><div className="template-grid">{items.map((t) => <button key={t.id}
+            className={`template-card ${selected === t.id ? 'selected' : ''}`} onClick={() => setSelected(t.id)}>
+            <b>{t.id} · {t.name}</b><span>{t.description}</span></button>)}</div>
+        </div>)}
+        <div className="template-actions"><button className="btn primary" disabled={!templates.length || ['queued', 'generating'].includes(job?.state)} onClick={generate}>
+          {['queued', 'generating'].includes(job?.state) ? '正在一次性生成…' : '使用所选模板生成纪要'}
+        </button></div>
+        {error && <p className="ag-error">{error}</p>}
+      </div>
+    </section>
+  );
+  const conclusions = summary.conclusions || {};
+  return (
+    <section className="panel generated-minutes">
+      <div className="panel-head"><div><h2>{summary.title || '会议纪要'}</h2><span className="meta">{summary.template?.name}</span></div>
+        <button className="btn ghost" onClick={() => { setJob(null); setShowPicker(true); }}>重新选择模板</button></div>
+      <div className="panel-body">
+        <div className="minutes-summary"><h3>会议摘要</h3><p>{summary.summary}</p></div>
+        {(summary.sections || []).map((section, i) => <div className="minutes-section" key={`${section.heading}-${i}`}><h3>{section.heading}</h3>
+          {section.items?.length ? <ul>{section.items.map((item, n) => <li key={n}>{item}</li>)}</ul> : <p className="muted">本场会议未形成相关内容</p>}</div>)}
+        {Object.entries(conclusions).some(([, values]) => values?.length) && <div className="minutes-section"><h3>结论分级</h3>
+          {Object.entries(conclusions).map(([kind, values]) => values?.length ? <div key={kind}><b>{({decisions:'会议决定',consensus:'已达成共识',tendencies:'倾向意见',suggestions:'个人建议',disagreements:'分歧意见',unresolved:'待确认事项'})[kind] || kind}</b><ul>{values.map((v, i) => <li key={i}>{v}</li>)}</ul></div> : null)}</div>}
+        {(summary.action_items || []).length > 0 && <div className="minutes-section"><h3>行动项</h3>{summary.action_items.map((item, i) => <div className="action-card" key={i}><b>{item.task}</b><span>责任人：{item.assignee} · 截止：{item.deadline}</span><span>成果：{item.deliverable} · 关闭标准：{item.closure_standard}</span></div>)}</div>}
+        {(summary.memory_candidates || []).length > 0 && <div className="minutes-section memory-candidates"><h3>可沉淀为会议记忆的候选</h3>
+          <ul>{summary.memory_candidates.map((item, i) => <li key={i}>{item.content}</li>)}</ul>
+          <button className="btn ghost" disabled={confirming} onClick={confirmCandidates}>{confirming ? '保存中…' : '确认写入会议记忆'}</button></div>}
+        {error && <p className="muted">{error}</p>}
+      </div>
+    </section>
+  );
+}
+
 /* ---------- full detail page ---------- */
 function DetailPage({meeting: initialMeeting, onBack, onDelete, onExport}) {
   const [meeting, setMeeting] = useState(initialMeeting);
@@ -297,19 +444,38 @@ function DetailPage({meeting: initialMeeting, onBack, onDelete, onExport}) {
   const lines = segmentsToLines(meeting);
   const chapters = buildChapters(s, new Date(meeting.created_at), durationSeconds(meeting) || 0);
   const concl = keyConclusions(s);
-  const summaryPending = meeting.summary_pending;
+  const summaryPending = ['queued', 'generating'].includes(meeting.minutes_status);
+  const transcriptProcessing = Boolean(meeting.processing?.active);
+  const refreshMeeting = async () => {
+    try {
+      setMeeting(await getMeeting(meeting.session_id));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const applyMinutesResult = (result) => {
+    if (!result) return;
+    setMeeting((current) => ({
+      ...current,
+      summary: result,
+      minutes_status: 'ready',
+      summary_pending: false,
+    }));
+  };
 
-  // Auto-refresh when summary is still generating
+  // Auto-refresh while either transcript processing or on-demand minutes generation is active.
   useEffect(() => {
-    if (!summaryPending) return;
+    if (!summaryPending && !transcriptProcessing) return;
     const timer = setInterval(async () => {
       try {
         const fresh = await getMeeting(meeting.session_id);
-        if (!fresh.summary_pending) { setMeeting(fresh); clearInterval(timer); }
+        setMeeting(fresh);
+        if (!fresh.summary_pending && !fresh.processing?.active) clearInterval(timer);
       } catch { /* ignore */ }
-    }, 8000);
+    }, 2000);
     return () => clearInterval(timer);
-  }, [summaryPending, meeting.session_id]);
+  }, [summaryPending, transcriptProcessing, meeting.session_id]);
 
   const handleSeek = (ms) => {
     setSeekMs(ms);
@@ -346,7 +512,7 @@ function DetailPage({meeting: initialMeeting, onBack, onDelete, onExport}) {
         <div>
           <div className="dh-title">
             <InlineTitle value={title} sessionId={meeting.session_id} onChange={setTitle} />
-            <span className="status ok">已完成</span>
+            <span className={`status ${['failed', 'stalled'].includes(meeting.processing?.stage) ? 'failed' : (meeting.processing?.active ? 'processing' : 'ok')}`}>{processingStatusLabel(meeting.processing)}</span>
           </div>
           <div className="dh-meta">
             <span><IconHistory /> {dateRangeLabel(meeting)}</span>
@@ -373,6 +539,8 @@ function DetailPage({meeting: initialMeeting, onBack, onDelete, onExport}) {
         </div>
       </div>
 
+      <ProcessingProgress status={meeting.processing} />
+
       {meeting.has_audio && (
         <div style={{marginBottom: 12}} ref={audioPlayerRef}>
           <AudioPlayer sessionId={meeting.session_id} onTimeUpdate={setSeekMs} />
@@ -391,49 +559,25 @@ function DetailPage({meeting: initialMeeting, onBack, onDelete, onExport}) {
       )}
 
       <div className="subtabs detail-subtabs" style={{borderBottom: '1px solid var(--border)', marginBottom: 16}}>
-        {[{id: 'captions', label: '字幕记录', icon: <IconCaptions />}, {id: 'minutes', label: '滚动纪要', icon: <IconMinutes />}, {id: 'mindmap', label: '思维导图', icon: <IconMindmap />}].map((t) => (
+        {[{id: 'captions', label: '完整转写与人员', icon: <IconCaptions />}, {id: 'minutes', label: '会议纪要', icon: <IconMinutes />}].map((t) => (
           <button key={t.id} className={tab === t.id ? 'active' : ''} onClick={() => setTab(t.id)}>{t.icon}{t.label}</button>
         ))}
       </div>
 
       {tab === 'captions' && (
-        <div className="cols c-3b" style={{height: 'auto'}}>
+        <div className="detail-transcript-layout">
           <section className="panel"><div className="panel-head"><h2>字幕记录</h2><span className="meta">{lines.length} 段{meeting.has_audio ? ' · 点击跳转录音' : ''}</span></div>
             <div className="panel-body" style={{maxHeight: 520}}>
               <CaptionStream lines={lines} partial="" recording={false} rolesById={rolesById} autoScroll={false}
                 onSeek={meeting.has_audio ? handleSeek : undefined} activeSeekMs={seekMs} />
             </div>
           </section>
-          <section className="panel"><div className="panel-head"><h2>会议摘要</h2></div>
-            <div className="panel-body"><SummarySection /></div>
-          </section>
-          <InfoColumn meeting={meeting} />
+          <div className="detail-transcript-side"><SpeakerMemoryEditor meeting={meeting} onChanged={refreshMeeting} /><InfoColumn meeting={meeting} /></div>
         </div>
       )}
 
       {tab === 'minutes' && (
-        <div className="cols c-2" style={{height: 'auto'}}>
-          <section className="panel"><div className="panel-head"><h2>滚动纪要</h2></div>
-            <div className="panel-body">
-              {summaryPending ? <div className="summary-pending"><div className="sp-spin" /><span>AI 纪要生成中…</span></div> : <RollingMinutes chapters={chapters} summary={s.summary} onSeek={meeting.has_audio ? handleSeek : undefined} />}
-            </div>
-          </section>
-          <InfoColumn meeting={meeting} />
-        </div>
-      )}
-
-      {tab === 'mindmap' && (
-        <div style={{display: 'flex', gap: 12, height: 560}}>
-          <section className="panel" style={{flex: 1, overflow: 'hidden'}}>
-            <div className="panel-head"><h2>思维导图</h2>{summaryPending && <span className="meta">生成中…</span>}</div>
-            <div style={{flex: 1, minHeight: 0}}>
-              {summaryPending
-                ? <div className="summary-pending"><div className="sp-spin" /><span>AI 纪要生成中…</span></div>
-                : <MindMap value={s.mindmap} onSelect={setMmNode} selectedKey={mmNode?.key} />}
-            </div>
-          </section>
-          {mmNode && <MindMapDetailPanel node={mmNode} onClose={() => setMmNode(null)} />}
-        </div>
+        <TemplateMinutesPanel meeting={meeting} onChanged={refreshMeeting} onMinutesReady={applyMinutesResult} />
       )}
     </div>
   );
@@ -458,6 +602,22 @@ export default function HistoryPanel({refreshKey, onUnauthorized}) {
     try { setMeetings((await listMeetings()).meetings); } catch (e) { handleError(e); } finally { setLoading(false); }
   };
   useEffect(() => { refresh(); }, [refreshKey]);
+
+  const hasBackgroundWork = meetings.some((meeting) => meeting.processing?.active);
+  useEffect(() => {
+    if (!hasBackgroundWork) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const next = (await listMeetings()).meetings;
+        setMeetings(next);
+        if (previewId) {
+          const preview = await getMeeting(previewId);
+          setPreviewMeeting(preview);
+        }
+      } catch { /* keep the last visible progress during a transient network error */ }
+    }, 2500);
+    return () => clearInterval(timer);
+  }, [hasBackgroundWork, previewId]);
 
   const fetchMeeting = async (sid) => { try { return await getMeeting(sid); } catch (e) { handleError(e); return null; } };
   const select = async (sid) => { setPreviewId(sid); setPreviewMeeting(null); setPreviewMeeting(await fetchMeeting(sid)); };

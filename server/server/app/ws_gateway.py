@@ -12,13 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from .audio_upload_api import CoverageTracker
 from .auth import CurrentUser, authenticated_user, require_auth
 from .deepseek_client import DeepSeekClient
-from .device_rolling_summary import DeviceRollingSummaryCoordinator
+from .device_rolling_summary import DeviceLiveTranscriptCoordinator
 from .funasr_client import FunASRClient
 from .lifecycle import MeetingLifecycle
+from .meeting_memory import MeetingMemory
 from .offline_jobs import OfflineJob, OfflineJobQueue
-from .post_meeting_diarizer import PostMeetingDiarizer
 from .translator import SessionTranslator
-from .timeline_chapters import enrich_summary_timeline, transcript_with_time_and_marks
 from .protocol import MessageType, event, normalize_language
 from .segments import Segment, Timeline
 from .session_manager import Session, SessionInUseError, SessionManager, SessionOwnershipError
@@ -32,11 +31,11 @@ sessions = SessionManager(data / "audio_cache", resume_window_seconds=resume_win
 storage = Storage(data)
 llm = DeepSeekClient()
 coverage = CoverageTracker(storage)   # 通道B音频覆盖区间（写透 SQLite，重启可恢复）
-rolling_min_segments = max(1, int(os.getenv("ROLLING_SUMMARY_MIN_SEGMENTS", "2")))
-device_rolling_max_wait = max(
-    0.05, float(os.getenv("DEVICE_ROLLING_SUMMARY_MAX_WAIT_SECONDS", "20")))
 meeting_end_audio_wait = float(os.getenv("MEETING_END_AUDIO_WAIT_SECONDS", "10"))
-post_meeting_diarizer = PostMeetingDiarizer()
+meeting_memory = MeetingMemory(storage)
+device_live = DeviceLiveTranscriptCoordinator(storage)
+# Internal compatibility name; this object no longer generates rolling minutes.
+device_rolling = device_live
 
 
 @router.websocket("/ws/{session_id}")
@@ -103,6 +102,7 @@ async def gateway(ws: WebSocket, session_id: str):
                         session.language = normalize_language(payload.get("language"))
                         session.summary_language = normalize_language(payload.get("summary_language"), summary=True)
                         session.speaker_enabled = bool(payload.get("enable_speaker", True))
+                        storage.set_speaker_diarization(session_id, session.speaker_enabled)
                         session.translate_to = str(payload.get("translate_to", "") or "").strip()
                         if session.translate_to and session.translator is None:
                             session.translator = SessionTranslator(
@@ -131,51 +131,20 @@ async def gateway(ws: WebSocket, session_id: str):
                     )
                     for result in await session.asr.finish():
                         await emit_asr_result(ws, session, result, schedule_update=False)
-                    if session.summary_task and not session.summary_task.done():
-                        with suppress(Exception):
-                            await session.summary_task
                     # 等音频尾片（常见情况 final 分片几百毫秒内已到；超时则走延迟定稿）
                     await lifecycle.wait_audio_complete(session_id, timeout=meeting_end_audio_wait)
                     # 先落盘（时间轴为准，含录制中已补的洞）——任何后续补洞任务的持久化都有文件可写，消除竞态
                     save_transcript_from_timeline(session)
-                    # ① 秒回初稿：滚动纪要立即作为结果返回（标签 draft），用户结束会议零等待；
-                    #    定稿（全文一致性整理）随后进行，完成后自动替换为最终版。
-                    inline = lifecycle.can_finish_inline(session_id, session)
-                    draft = dict(session.latest_summary or {})
-                    draft.setdefault("summary", "会议已结束，纪要整理中…")
-                    draft.setdefault("decisions", [])
-                    draft.setdefault("action_items", [])
-                    draft.setdefault("mindmap", {"title": "会议重点", "branches": []})
-                    draft["summary_stage"] = "draft"
                     await send_json(ws, session, event(
                         MessageType.MEETING_RESULT,
-                        result=draft,
-                        summary=draft["summary"],
-                        decisions=draft["decisions"],
-                        action_items=draft["action_items"],
-                        summary_stage="draft",
-                        pending=not inline,
+                        result={"state": "finalizing"},
+                        summary_stage="disabled",
+                        pending=True,
                     ))
-                    if inline:
-                        # ② 音频完整、无洞：初稿已在手，现在后台出最终版；出完趁连接还开着推送升级
-                        lifecycle.finish_inline(session_id)
-                        result = await finish_summary(session)
-                        await send_json(ws, session, event(
-                            MessageType.MEETING_RESULT,
-                            result=result,
-                            summary=result["summary"],
-                            decisions=result["decisions"],
-                            action_items=result["action_items"],
-                            summary_stage="final",
-                        ))
-                    else:
-                        # ③ 有残余洞/音频未传完：挂入 finalizing。补录段到达后增量并入纪要
-                        #    （_on_offline_applied → merge_gap），全部补齐后哨兵出最终版。
-                        storage.set_state(session_id, "finalizing")
-                        storage.set_meta_info(session_id, session.language, session.summary_language,
-                                              session.speaker.summary())   # 重启后恢复出纪要所需
-                        storage.save_summary_draft(session_id, draft)      # 历史页立即有初稿可看（不动 finalizing 状态）
-                        await lifecycle.defer_finalize(session_id, session)
+                    storage.set_state(session_id, "finalizing")
+                    storage.set_meta_info(session_id, session.language, session.summary_language,
+                                          session.speaker.summary())
+                    await lifecycle.defer_finalize(session_id, session, canonical=True)
                     ended = True
                     break
     except WebSocketDisconnect:
@@ -185,9 +154,6 @@ async def gateway(ws: WebSocket, session_id: str):
         with suppress(Exception):
             await send_json(ws, session, event(MessageType.ERROR, message="服务器处理失败，请查看服务端日志"))
     finally:
-        if session.summary_task and not session.summary_task.done():
-            session.summary_task.cancel()
-            session.summary_task = None
         with suppress(Exception):
             await session.asr.close()
         session.audio.close()
@@ -256,7 +222,8 @@ async def _finalize_when_expired(session_id: str, session: Session):
     if session.transcript or session.timeline.ordered():
         with suppress(Exception):
             save_transcript_from_timeline(session)
-            await finish_summary(session)
+            storage.set_state(session_id, "transcript_ready")
+            storage.cleanup_live_audio(session_id)
     logger.info("suspended_session_finalized session_id=%s segments=%d", session_id, len(session.transcript))
 
 
@@ -269,47 +236,6 @@ def save_transcript_from_timeline(session: Session) -> None:
     """以时间轴为唯一来源落盘（含实时段的说话人 + 录制中已补的洞）。"""
     path = storage.save_transcript(session.id, session.timeline.to_transcript_lines(), session.timeline.to_list())
     logger.info("transcript_saved session_id=%s path=%s", session.id, path.resolve())
-
-
-async def finish_summary(session: Session) -> dict:
-    """出最终纪要（每场会议整个生命周期只应发生一次：内联路径或哨兵任务，二选一）。"""
-    stored = storage.get_meeting(session.id) or {}
-    transcript = transcript_with_time_and_marks(
-        session.timeline.to_list(), stored.get("marks") or [])
-    result = await summarize_safely(transcript, rolling=False, source_language=session.language,
-                                    output_language=session.summary_language)
-    result = enrich_summary_timeline(storage, session.id, result, rolling=False)
-    result["source_language"] = session.language
-    result["summary_language"] = session.summary_language
-    result["speakers"] = session.speaker.summary()
-    result["summary_stage"] = "final"
-    summary_path = storage.save_summary(session.id, result)
-    storage.cleanup_live_audio(session.id)   # 定稿后：.b.pcm 完整则删实时流 .pcm（播放已切 .b.pcm）
-    logger.info("summary_saved session_id=%s path=%s", session.id, summary_path.resolve())
-    return result
-
-
-async def summarize_safely(transcript: str, *, rolling: bool, source_language: str = "auto",
-                           output_language: str = "auto") -> dict:
-    try:
-        return await llm.summarize(transcript, rolling=rolling, source_language=source_language,
-                                   output_language=output_language)
-    except Exception as exc:
-        logger.exception("deepseek_error rolling=%s error=%s", rolling, exc)
-        return {
-            "summary": "智能纪要暂时生成失败，最终转写已安全保存。",
-            "decisions": [],
-            "action_items": [],
-            "mindmap": {"title": "会议重点", "branches": []},
-        }
-
-
-device_rolling = DeviceRollingSummaryCoordinator(
-    storage,
-    summarize_safely,
-    min_segments=rolling_min_segments,
-    max_wait_seconds=device_rolling_max_wait,
-)
 
 
 async def emit_asr_result(
@@ -377,15 +303,12 @@ async def emit_asr_result(
     await send_json(ws, session, payload)
     await session.broadcast(payload)
     logger.info(
-        "asr_result session_id=%s seq=%d mode=%s is_final=%s speaker_id=%s chars=%d bytes=%d",
-        session.id, session.sequence, result.get("mode"), is_final, speaker_id,
-        len(text), len(text.encode("utf-8")),
+        "asr_result session_id=%s seq=%d mode=%s is_final=%s speaker_id=%s text=%s",
+        session.id, session.sequence, result.get("mode"), is_final, speaker_id, text,
     )
     # 实时翻译（v2 管道）：终句入串行队列——保序、带上下文、同语言跳过，绝不阻塞字幕链
     if is_final and session.translator is not None and seg_id:
         await session.translator.enqueue(seg_id, text)
-    if schedule_update and is_final:
-        maybe_schedule_rolling_update(ws, session)
 
 
 def _make_translation_sink(session: Session):
@@ -401,40 +324,6 @@ def _make_translation_sink(session: Session):
                 await send_json(session.live_ws, session, msg)
         await session.broadcast(msg)
     return sink
-
-
-def maybe_schedule_rolling_update(ws: WebSocket, session: Session):
-    enough_new_text = len(session.transcript) - session.last_summarized_count >= rolling_min_segments
-    task_running = session.summary_task and not session.summary_task.done()
-    if not enough_new_text or task_running:
-        return
-    snapshot = list(session.transcript)
-    session.last_summarized_count = len(snapshot)
-    session.summary_task = asyncio.create_task(send_rolling_update(ws, session, snapshot))
-
-
-async def send_rolling_update(ws: WebSocket, session: Session, transcript: list[str]):
-    result = await summarize_safely("\n".join(transcript), rolling=True,
-                                    source_language=session.language,
-                                    output_language=session.summary_language)
-    result = enrich_summary_timeline(storage, session.id, result, rolling=True)
-    session.latest_summary = result
-    payload = event(
-        MessageType.MEETING_UPDATE,
-        result=result,
-        summary=result["summary"],
-        decisions=result["decisions"],
-        action_items=result["action_items"],
-        final=False,
-        source_language=session.language,
-        summary_language=session.summary_language,
-    )
-    await send_json(ws, session, payload)
-    await session.broadcast(payload)
-    logger.info(
-        "rolling_summary_sent session_id=%s final_segments=%d",
-        session.id, len(transcript),
-    )
 
 
 async def ensure_asr_started(session: Session):
@@ -522,7 +411,7 @@ def _get_timeline(session_id: str) -> Timeline | None:
 
 
 async def _on_offline_applied(session_id: str, timeline: Timeline, patch, reason: str) -> None:
-    """补洞（gap/bulk）应用后的回调：持久化 + 原位推送；录制中另刷滚动纪要。最终纪要不在这里出。"""
+    """补洞只更新可靠转写和客户端字幕，绝不触发模型调用。"""
     # 1) 增量持久化（只动 patch 涉及的分段，不整表重写——不会误删内存 timeline 里没有的旧段）
     storage.apply_patch(session_id, patch.to_dict())
     # Device session revision is a semantic result cursor, not an upload
@@ -536,14 +425,12 @@ async def _on_offline_applied(session_id: str, timeline: Timeline, patch, reason
         if row is not None:
             revision = int(row["revision"]) + 1
             conn.execute(
-                "UPDATE device_sessions SET revision=?,caption_revision=?,updated_at=?"
-                " WHERE server_session_id=?",
-                (revision, revision, now, session_id))
+                "UPDATE device_sessions SET revision=?,updated_at=? WHERE server_session_id=?",
+                (revision, now, session_id))
             for segment in patch.added:
                 conn.execute(
-                    "UPDATE segments SET revision=?,caption_revision=?"
-                    " WHERE session_id=? AND seg_id=?",
-                    (revision, revision, session_id, segment.seg_id))
+                    "UPDATE segments SET revision=? WHERE session_id=? AND seg_id=?",
+                    (revision, session_id, segment.seg_id))
     s = sessions.get(session_id)
     live = s is not None and s.live_ws is not None and session_id not in lifecycle.ended
     # 补洞内容也进翻译管道（否则双语记录在断网段有洞）。上下文顺序略受影响，可接受；
@@ -559,109 +446,157 @@ async def _on_offline_applied(session_id: str, timeline: Timeline, patch, reason
         with suppress(Exception):
             await send_json(s.live_ws, s, evt)
         await s.broadcast(evt)
-    # 3) 录制中：把补回的内容并入滚动纪要（用户核心场景：打电话回来洞填上、纪要跟着更新）
-    if live:
-        result = await summarize_safely("\n".join(timeline.to_transcript_lines()), rolling=True,
-                                        source_language=s.language, output_language=s.summary_language)
-        result["summary_stage"] = "rolling"
-        s.latest_summary = result
-        upd = event(MessageType.MEETING_UPDATE, result=result, summary=result["summary"],
-                    decisions=result["decisions"], action_items=result["action_items"], final=False,
-                    summary_stage="rolling")
-        with suppress(Exception):
-            await send_json(s.live_ws, s, upd)
-        await s.broadcast(upd)
-        return
-    # 4) 已结束、挂在 finalizing 等补录的会议：补录段"适当总结插入"现有纪要
-    #    （增量小调用，不重发全文；历史页立即可看，结果页还开着就同步推送升级）
-    fs = lifecycle.finalizing.get(session_id)
-    if fs is not None and patch.added:
-        gap_text = "\n".join(p.get("text", "") for p in patch.to_dict().get("patches", []) if p.get("text"))
-        merged = await llm.merge_gap(fs.latest_summary or {}, gap_text,
-                                     source_language=fs.language, output_language=fs.summary_language)
-        merged["summary_stage"] = "gap_merged"
-        fs.latest_summary = merged
-        storage.save_summary_draft(session_id, merged)
-        logger.info("gap_summary_merged session_id=%s reason=%s", session_id, reason)
-        upd = event(MessageType.MEETING_UPDATE, result=merged, summary=merged["summary"],
-                    decisions=merged["decisions"], action_items=merged["action_items"], final=False,
-                    summary_stage="gap_merged")
-        if fs.live_ws is not None:
-            with suppress(Exception):
-                await send_json(fs.live_ws, fs, upd)
-        await fs.broadcast(upd)
-    # 5) 会议已完全关闭（罕见：补洞任务重试成功晚于最终纪要，如离线服务恢复后）→ 重出一次纪要覆盖
-    elif (s is None and patch.added
+    # 已完全关闭时追加发布屏障；已挂在 finalizing 的会议由 lifecycle 自己排队。
+    if (not live and s is None and patch.added
           and session_id not in sessions.suspended
           and session_id not in lifecycle.finalizing
-          # 设备录音由持久队列的 summarize 完成屏障负责定稿。范围上传期间的
-          # 5 分钟预转写绝不能在 /complete 之前触发最终纪要。
           and storage.db.query_one(
               "SELECT 1 FROM device_sessions WHERE server_session_id=?", (session_id,)) is None):
-        await offline_queue.enqueue(session_id, 0, 0, "summarize")
+        await offline_queue.enqueue(session_id, 0, 0, "publish")
+
+
+def _overlap_ms(left: dict, right: dict) -> int:
+    return max(0, min(int(left.get("end_ms") or 0), int(right.get("end_ms") or 0))
+               - max(int(left.get("start_ms") or 0), int(right.get("start_ms") or 0)))
+
+
+def _align_canonical_speakers(canonical: list[dict], existing: list[dict]) -> list[dict]:
+    """Map whole-meeting clusters onto trustworthy live IDs without imposing K."""
+    anchors = [item for item in existing
+               if item.get("source") == "live" and item.get("speaker_id")]
+    canonical_ids = []
+    for item in canonical:
+        speaker_id = item.get("speaker_id")
+        if speaker_id and speaker_id not in canonical_ids:
+            canonical_ids.append(speaker_id)
+    votes = {}
+    for item in canonical:
+        canonical_id = item.get("speaker_id")
+        if not canonical_id:
+            continue
+        for anchor in anchors:
+            overlap = _overlap_ms(item, anchor)
+            if overlap:
+                key = (canonical_id, str(anchor["speaker_id"]))
+                votes[key] = votes.get(key, 0) + overlap
+    mapping = {}
+    used_anchor_ids = set()
+    for (canonical_id, anchor_id), overlap in sorted(
+            votes.items(), key=lambda pair: (-pair[1], pair[0])):
+        if overlap < 1000 or canonical_id in mapping or anchor_id in used_anchor_ids:
+            continue
+        mapping[canonical_id] = anchor_id
+        used_anchor_ids.add(anchor_id)
+    reserved = {str(item["speaker_id"]) for item in anchors}
+    reserved.update(mapping.values())
+    next_number = 1
+    for canonical_id in canonical_ids:
+        if canonical_id in mapping:
+            continue
+        while f"spk_{next_number:02d}" in reserved:
+            next_number += 1
+        mapping[canonical_id] = f"spk_{next_number:02d}"
+        reserved.add(mapping[canonical_id])
+        next_number += 1
+    aligned = []
+    for item in canonical:
+        copy = dict(item)
+        speaker_id = mapping.get(copy.get("speaker_id"))
+        copy["speaker_id"] = speaker_id
+        copy["speaker_label"] = (
+            f"说话人 {int(speaker_id.rsplit('_', 1)[1])}" if speaker_id else None)
+        copy["speaker_final"] = True
+        copy["source"] = "offline_canonical"
+        copy["state"] = "final"
+        aligned.append(copy)
+    return aligned
+
+
+async def _on_canonical_finalized(session_id: str, payload: dict) -> None:
+    row = storage.db.query_one(
+        "SELECT canonical_sha256,expected_samples,speaker_diarization_enabled FROM device_sessions"
+        " WHERE server_session_id=?", (session_id,))
+    expected_sha256 = str(row["canonical_sha256"] or "").lower() if row else ""
+    if expected_sha256 and str(payload.get("canonical_sha256") or "").lower() != expected_sha256:
+        raise RuntimeError("canonical finalizer SHA-256 does not match device metadata")
+    if row:
+        duration_ms = int(row["expected_samples"] or 0) * 1000 // 16000
+        speaker_enabled = bool(row["speaker_diarization_enabled"])
+    else:
+        meeting_row = storage.db.query_one(
+            "SELECT audio_end_ms,speaker_diarization_enabled FROM meetings WHERE session_id=?",
+            (session_id,))
+        if meeting_row is None:
+            raise RuntimeError("meeting is missing during canonical finalization")
+        duration_ms = int(meeting_row["audio_end_ms"] or 0)
+        speaker_enabled = bool(meeting_row["speaker_diarization_enabled"])
+    raw_segments = payload.get("segments") or []
+    if not raw_segments:
+        raise RuntimeError("canonical finalizer returned an empty timeline")
+    canonical = []
+    previous_start = -1
+    for item in raw_segments:
+        start_ms = max(0, int(item.get("start_ms") or 0))
+        end_ms = max(start_ms, int(item.get("end_ms") or start_ms))
+        text = str(item.get("text") or "").strip()
+        if not text or end_ms <= start_ms or (duration_ms and end_ms > duration_ms + 1000):
+            raise RuntimeError("canonical finalizer returned an invalid segment")
+        if start_ms < previous_start:
+            raise RuntimeError("canonical finalizer returned an unsorted timeline")
+        previous_start = start_ms
+        canonical.append({**item, "start_ms": start_ms, "end_ms": end_ms, "text": text})
+    session = sessions.get(session_id) or lifecycle.finalizing.get(session_id)
+    existing = session.timeline.to_list() if session is not None else (
+        (storage.get_meeting(session_id) or {}).get("segments") or [])
+    canonical = _align_canonical_speakers(canonical, existing)
+    if not speaker_enabled:
+        for item in canonical:
+            item["speaker_id"] = None
+            item["speaker_label"] = None
+    speaker_counts = {}
+    for item in canonical:
+        speaker_id = item.get("speaker_id")
+        if speaker_id:
+            speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+    payload["speaker_count"] = len(speaker_counts)
+    payload["speakers"] = [
+        {"speaker_id": speaker_id,
+         "label": f"说话人 {int(speaker_id.rsplit('_', 1)[1])}",
+         "segment_count": count}
+        for speaker_id, count in sorted(speaker_counts.items())]
+    revision = storage.replace_canonical_segments(session_id, canonical, payload)
+    await meeting_memory.match_session(session_id)
+    canonical = storage.load_segments(session_id)
+    timeline = Timeline.from_list(canonical)
+    if session is not None:
+        session.timeline = timeline
+        session.transcript_segments = canonical
+        session.transcript = timeline.to_transcript_lines()
+    logger.info(
+        "canonical_timeline_committed session_id=%s revision=%d segments=%d speakers=%d pipeline=%s",
+        session_id, revision, len(canonical), len(speaker_counts),
+        str(payload.get("pipeline_version") or ""))
 
 
 async def _on_finalize_summary(session_id: str) -> None:
-    """summarize 哨兵：本会话补洞任务（FIFO 在前）已全部应用，出唯一一次最终纪要。"""
+    """完成屏障：发布完整转写并停止，不自动生成任何会议纪要。"""
     session = lifecycle.pop_finalizing(session_id)
     if session is not None:
-        result = await finish_summary(session)
+        save_transcript_from_timeline(session)
     else:
-        # 兜底（server 重启恢复 / finalizing 状态丢失）：从库读转写与元数据出纪要
         meeting = storage.get_meeting(session_id)
         if meeting is None:
-            logger.warning("finalize_summary_no_meeting session_id=%s", session_id)
+            logger.warning("publish_transcript_no_meeting session_id=%s", session_id)
             if storage.db.query_one(
                     "SELECT 1 FROM device_sessions WHERE server_session_id=?"
                     " AND status NOT IN ('done','cancelled')", (session_id,)) is not None:
-                raise RuntimeError("meeting metadata is missing during finalization")
+                raise RuntimeError("meeting metadata is missing during transcript publication")
             return
-        device_session = storage.db.query_one(
-            "SELECT speaker_diarization_enabled FROM device_sessions WHERE server_session_id=?",
-            (session_id,))
-        diarization = None
-        if device_session is not None and bool(device_session["speaker_diarization_enabled"]):
-            audio_path = data / "audio_cache" / f"{session_id}.b.pcm"
-            diarization = await post_meeting_diarizer.correct(
-                audio_path, meeting.get("segments") or [])
-            if diarization.get("status") == "corrected":
-                storage.replace_segments(session_id, diarization["segments"])
-                # Post-meeting diarization changes speaker metadata only.  Give
-                # it a speaker-channel stamp without making old firmware fetch
-                # the same caption text as a new caption.
-                with storage.db.transaction() as conn:
-                    row = conn.execute(
-                        "SELECT revision FROM device_sessions WHERE server_session_id=?",
-                        (session_id,)).fetchone()
-                    if row is not None:
-                        speaker_revision = int(row["revision"]) + 1
-                        conn.execute(
-                            "UPDATE device_sessions SET revision=?,speaker_revision=?,updated_at=?"
-                            " WHERE server_session_id=?",
-                            (speaker_revision, speaker_revision,
-                             datetime.now(timezone.utc).isoformat(), session_id))
-                        conn.execute(
-                            "UPDATE segments SET revision=?,speaker_revision=?"
-                            " WHERE session_id=?",
-                            (speaker_revision, speaker_revision, session_id))
-                meeting = storage.get_meeting(session_id) or meeting
-        meta = storage.get_meta_info(session_id)
-        result = await summarize_safely(transcript_with_time_and_marks(
-            meeting.get("segments") or [], meeting.get("marks") or []), rolling=False,
-                                        source_language=meta["language"],
-                                        output_language=meta["summary_language"])
-        result = enrich_summary_timeline(storage, session_id, result, rolling=False)
-        result["summary_stage"] = "final"
-        result.setdefault("speakers", (diarization or {}).get("speakers") or meta["speakers"])
-        storage.merge_summary(session_id, result)
-        storage.cleanup_live_audio(session_id)
-    if storage.db.query_one(
-            "SELECT 1 FROM device_sessions WHERE server_session_id=?", (session_id,)):
-        await device_rolling.publish_final(session_id, result)
-    logger.info("finalize_summary_done session_id=%s", session_id)
+    storage.set_state(session_id, "transcript_ready")
+    storage.cleanup_live_audio(session_id)
+    logger.info("transcript_ready session_id=%s", session_id)
     storage.db.execute(
-        "UPDATE device_sessions SET status='done',revision=revision+1,"
-        "summary_revision=revision+1,updated_at=?"
+        "UPDATE device_sessions SET status='done',revision=revision+1,updated_at=?"
         " WHERE server_session_id=? AND status NOT IN ('done','failed')",
         (datetime.now(timezone.utc).isoformat(), session_id))
 
@@ -689,17 +624,11 @@ async def _on_offline_give_up(job: OfflineJob, exc: Exception) -> None:
 
 offline_queue = OfflineJobQueue(data / "audio_cache", _get_timeline, _on_offline_applied,
                                 on_summarize=_on_finalize_summary,
+                                on_canonical=_on_canonical_finalized,
                                 on_gap_done=lambda sid, s, e: storage.delete_gap(sid, s),
                                 on_give_up=_on_offline_give_up,
                                 db=storage.db)
 lifecycle = MeetingLifecycle(sessions, coverage, offline_queue, storage=storage)
-
-
-async def _finish_summary_logged(session: Session) -> None:
-    try:
-        await finish_summary(session)
-    except Exception:
-        logger.exception("http_end_summary_failed session_id=%s", session.id)
 
 
 @router.post("/api/v1/sessions/{session_id}/end")
@@ -741,21 +670,10 @@ async def end_meeting_http(session_id: str, user: CurrentUser = Depends(require_
         session.meeting_ended = True
         await lifecycle.wait_audio_complete(session_id, timeout=meeting_end_audio_wait)
         save_transcript_from_timeline(session)
-        if lifecycle.can_finish_inline(session_id, session):
-            lifecycle.finish_inline(session_id)
-            asyncio.create_task(_finish_summary_logged(session))   # 纪要后台出，HTTP 秒回
-        else:
-            storage.set_state(session_id, "finalizing")
-            storage.set_meta_info(session_id, session.language, session.summary_language,
-                                  session.speaker.summary())
-            draft = dict(session.latest_summary or {})
-            draft.setdefault("summary", "会议已结束，纪要整理中…")
-            draft.setdefault("decisions", [])
-            draft.setdefault("action_items", [])
-            draft.setdefault("mindmap", {"title": "会议重点", "branches": []})
-            draft["summary_stage"] = "draft"
-            storage.save_summary_draft(session_id, draft)
-            await lifecycle.defer_finalize(session_id, session)
+        storage.set_state(session_id, "finalizing")
+        storage.set_meta_info(session_id, session.language, session.summary_language,
+                              session.speaker.summary())
+        await lifecycle.defer_finalize(session_id, session, canonical=True)
         if session.translator is not None:
             asyncio.create_task(session.translator.close())   # 排空已入队译句后退出，不泄漏 worker
             session.translator = None
@@ -765,9 +683,11 @@ async def end_meeting_http(session_id: str, user: CurrentUser = Depends(require_
     state = storage.get_state(session_id)
     if state is None:
         raise HTTPException(status_code=404, detail="会议不存在")
-    if state == "done":
-        return {"ok": True, "state": "done"}
+    if state in {"done", "transcript_ready"}:
+        return {"ok": True, "state": state}
     storage.set_state(session_id, "finalizing")
-    await offline_queue.enqueue(session_id, 0, 0, "summarize")
+    if storage.needs_canonical_finalization(session_id):
+        await offline_queue.enqueue(session_id, 0, 0, "canonical")
+    await offline_queue.enqueue(session_id, 0, 0, "publish")
     logger.info("meeting_end_via_http_recovered session_id=%s prev_state=%s", session_id, state)
     return {"ok": True, "state": "finalizing"}

@@ -7,7 +7,6 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,9 +44,8 @@ static const char *TAG = "sd";
 #define CARD_META_PATH MOUNT_POINT "/luoye-card.json"
 #define CARD_PROBE_PATH MOUNT_POINT "/.luoye-write-test.tmp"
 #define CARD_SPEED_PROBE_PATH MOUNT_POINT "/.luoye-speed-test.tmp"
-#define CARD_SCHEMA "luoye-storage/2"
 #define WRITE_SAMPLES 2048
-#define SYNC_INTERVAL_BYTES (32U * 1024U)
+#define SYNC_INTERVAL_BYTES (64U * 1024U)
 #define SESSION_DIR_BYTES 160
 #define SESSION_ID_BYTES 48
 #define JSON_PATH_BYTES 208
@@ -55,10 +53,6 @@ static const char *TAG = "sd";
 #define SD_SPI_TRANSFER_BYTES (64U * 1024U)
 #define SD_SPI_FREQUENCY_KHZ SDMMC_FREQ_DEFAULT
 #define SD_DMA_READ_BYTES (16U * 1024U)
-#define SD_DMA_LOW_WATER_BYTES (8U * 1024U)
-#define SD_DMA_LOW_WATER_WAIT_MS 20U
-#define SD_DMA_LOW_WATER_TIMEOUT_MS 30000U
-#define SD_DMA_PREPARE_GUARD_BYTES (16U * 1024U)
 
 static sdmmc_card_t *s_card;
 static uint32_t s_sd_freq_khz;
@@ -66,78 +60,98 @@ static storage_post_fn s_post;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_power_diag_lock;
 static SemaphoreHandle_t s_dma_read_lock;
-static bool s_recovery_blocked;
-static bool s_storage_ready;
-static bool s_format_in_progress;
+static uint8_t *s_dma_read_buffer;
 
-static esp_err_t wait_for_sd_dma_headroom(void) {
-  int64_t started_us = esp_timer_get_time();
-  bool waiting = false;
-  while (true) {
-    size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
-                                              MALLOC_CAP_DMA);
-    size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                          MALLOC_CAP_DMA);
-    if (largest_dma >= SD_DMA_LOW_WATER_BYTES) {
-      if (waiting) {
-        ESP_LOGI(TAG,
-                 "LY|STORAGE_DMA|event=backpressure state=recovered waited_ms=%llu free_dma=%u largest_dma=%u low_water=%u",
-                 (unsigned long long)((esp_timer_get_time() - started_us) / 1000),
-                 (unsigned)free_dma, (unsigned)largest_dma,
-                 (unsigned)SD_DMA_LOW_WATER_BYTES);
-      }
-      return ESP_OK;
-    }
-    uint64_t waited_ms = (uint64_t)(esp_timer_get_time() - started_us) / 1000U;
-    if (!waiting) {
-      waiting = true;
-      ESP_LOGW(TAG,
-               "LY|STORAGE_DMA|event=backpressure state=wait free_dma=%u largest_dma=%u low_water=%u",
-               (unsigned)free_dma, (unsigned)largest_dma,
-               (unsigned)SD_DMA_LOW_WATER_BYTES);
-    }
-    if (waited_ms >= SD_DMA_LOW_WATER_TIMEOUT_MS) {
-      ESP_LOGE(TAG,
-               "LY|STORAGE_DMA|event=backpressure state=timeout waited_ms=%llu free_dma=%u largest_dma=%u low_water=%u",
-               (unsigned long long)waited_ms, (unsigned)free_dma,
-               (unsigned)largest_dma, (unsigned)SD_DMA_LOW_WATER_BYTES);
-      return ESP_ERR_NO_MEM;
-    }
-    vTaskDelay(pdMS_TO_TICKS(SD_DMA_LOW_WATER_WAIT_MS));
+typedef enum {
+  STORAGE_RUNTIME_UNAVAILABLE = 0,
+  STORAGE_RUNTIME_INITIALIZING,
+  STORAGE_RUNTIME_READY,
+  STORAGE_RUNTIME_FAULTED,
+} storage_runtime_state_t;
+
+static volatile storage_runtime_state_t s_storage_state =
+    STORAGE_RUNTIME_UNAVAILABLE;
+static portMUX_TYPE s_storage_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool storage_state_allows_io(void) {
+  storage_runtime_state_t state = s_storage_state;
+  return state == STORAGE_RUNTIME_INITIALIZING ||
+         state == STORAGE_RUNTIME_READY;
+}
+
+bool storage_sd_faulted(void) {
+  return s_storage_state == STORAGE_RUNTIME_FAULTED;
+}
+
+void storage_sd_report_io_fault(const char *source, esp_err_t error,
+                                int io_errno) {
+  bool first = false;
+  portENTER_CRITICAL(&s_storage_state_mux);
+  if (s_storage_state != STORAGE_RUNTIME_FAULTED) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
+    first = true;
   }
+  portEXIT_CRITICAL(&s_storage_state_mux);
+  if (first) {
+    ESP_LOGE(TAG,
+             "LY|STORAGE_FAULT|source=%s esp=%s errno=%d action=block_runtime_io",
+             source ? source : "unknown", esp_err_to_name(error), io_errno);
+  }
+}
+
+static bool storage_errno_is_io_fault(int value) {
+  return value == EIO || value == ENODEV || value == ENXIO ||
+         value == ETIMEDOUT;
 }
 
 esp_err_t storage_sd_read(FILE *file, void *buffer, size_t wanted,
                           size_t *received) {
-  if (!file || !buffer || !received || !s_dma_read_lock) {
+  if (!file || !buffer || !received || !s_dma_read_lock ||
+      !s_dma_read_buffer) {
     return ESP_ERR_INVALID_STATE;
   }
   *received = 0;
   if (!wanted) return ESP_OK;
+  if (!storage_state_allows_io()) return ESP_ERR_INVALID_STATE;
   int fd = fileno(file);
   if (fd < 0) return ESP_ERR_INVALID_ARG;
   if (xSemaphoreTake(s_dma_read_lock, portMAX_DELAY) != pdTRUE) {
     return ESP_ERR_TIMEOUT;
   }
+  /* The state may have faulted while this reader waited behind another
+     transfer. Never enter FatFs after crossing that runtime boundary. */
+  if (!storage_state_allows_io()) {
+    xSemaphoreGive(s_dma_read_lock);
+    return ESP_ERR_INVALID_STATE;
+  }
   uint8_t *destination = (uint8_t *)buffer;
   esp_err_t result = ESP_OK;
   while (*received < wanted) {
+    if (!storage_state_allows_io()) {
+      result = ESP_ERR_INVALID_STATE;
+      break;
+    }
     size_t remaining = wanted - *received;
     size_t chunk = remaining < SD_DMA_READ_BYTES
                      ? remaining : SD_DMA_READ_BYTES;
-    result = wait_for_sd_dma_headroom();
-    if (result != ESP_OK) break;
-    /* The stock SDSPI driver owns its DMA block buffer and copies into this
-       caller buffer. A second 16 KiB internal staging area only fragments the
-       DMA heap, so read directly into internal RAM or PSRAM. */
+    /* Do not use fread here. Newlib may place its hidden FILE buffer in
+       PSRAM, causing the SDSPI driver to allocate a private internal DMA
+       buffer under upload pressure. A failed private allocation enters a
+       broken ESP-IDF 5.5.4 cleanup path. Reading the underlying VFS fd sends
+       our permanently reserved DMA-capable buffer directly to SDSPI. */
     ssize_t count;
     do {
-      count = read(fd, destination + *received, chunk);
+      count = read(fd, s_dma_read_buffer, chunk);
     } while (count < 0 && errno == EINTR);
     if (count <= 0) {
+      int read_errno = count < 0 ? errno : 0;
+      if (count < 0 && storage_errno_is_io_fault(read_errno)) {
+        storage_sd_report_io_fault("read", ESP_FAIL, read_errno);
+      }
       result = ESP_FAIL;
       break;
     }
+    memcpy(destination + *received, s_dma_read_buffer, (size_t)count);
     *received += (size_t)count;
     if ((size_t)count != chunk) {
       result = ESP_FAIL;
@@ -146,66 +160,6 @@ esp_err_t storage_sd_read(FILE *file, void *buffer, size_t wanted,
   }
   xSemaphoreGive(s_dma_read_lock);
   return result == ESP_OK && *received == wanted ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t storage_sd_seek(FILE *file, uint32_t offset) {
-  if (!file || offset > (uint32_t)LONG_MAX) return ESP_ERR_INVALID_ARG;
-  int fd = fileno(file);
-  if (fd < 0) return ESP_ERR_INVALID_ARG;
-  off_t positioned;
-  do {
-    positioned = lseek(fd, (off_t)offset, SEEK_SET);
-  } while (positioned < 0 && errno == EINTR);
-  return positioned == (off_t)offset ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t storage_sd_size(FILE *file, size_t *size_out) {
-  if (!file || !size_out) return ESP_ERR_INVALID_ARG;
-  int fd = fileno(file);
-  struct stat info;
-  if (fd < 0 || fstat(fd, &info) != 0 || info.st_size < 0 ||
-      (uint64_t)info.st_size > SIZE_MAX) {
-    return ESP_FAIL;
-  }
-  *size_out = (size_t)info.st_size;
-  return ESP_OK;
-}
-
-esp_err_t storage_sd_prepare_range(FILE *file, uint32_t file_offset) {
-  if (!file || file_offset > (uint32_t)LONG_MAX) return ESP_ERR_INVALID_ARG;
-  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
-                                                 MALLOC_CAP_8BIT);
-  size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                        MALLOC_CAP_DMA);
-  if (largest_dma < SD_DMA_PREPARE_GUARD_BYTES) {
-    ESP_LOGW(TAG,
-             "LY|STORAGE_DMA|event=range_prepare offset=%lu result=defer free_internal=%u largest_dma=%u guard=%u",
-             (unsigned long)file_offset, (unsigned)free_internal,
-             (unsigned)largest_dma, (unsigned)SD_DMA_PREPARE_GUARD_BYTES);
-    return ESP_ERR_NO_MEM;
-  }
-  if (storage_sd_seek(file, file_offset) != ESP_OK) return ESP_FAIL;
-
-  /* WAV PCM begins at byte 44, so the first FatFS read is not sector aligned.
-     Prime that sector before esp_http_client_open() grows the TCP/HTTP working
-     set. CONFIG_FATFS_ALLOC_PREFER_EXTRAM is enabled, while the official SDSPI
-     driver uses its own DMA-capable bounce buffer when one is required. */
-  uint8_t first_byte = 0;
-  size_t received = 0;
-  esp_err_t result = storage_sd_read(file, &first_byte, 1, &received);
-  if (result == ESP_OK && received == 1 &&
-      storage_sd_seek(file, file_offset) == ESP_OK) {
-    ESP_LOGI(TAG,
-             "LY|STORAGE_DMA|event=range_prepare offset=%lu result=ready free_internal=%u largest_dma=%u",
-             (unsigned long)file_offset, (unsigned)free_internal,
-             (unsigned)largest_dma);
-    return ESP_OK;
-  }
-  ESP_LOGW(TAG,
-           "LY|STORAGE_DMA|event=range_prepare offset=%lu result=failed esp=%s received=%u errno=%d",
-           (unsigned long)file_offset, esp_err_to_name(result),
-           (unsigned)received, errno);
-  return result == ESP_OK ? ESP_FAIL : result;
 }
 
 static void digest_to_hex(const unsigned char digest[32], char hex[65]) {
@@ -245,7 +199,7 @@ static bool power_csv_digest(FILE *file, unsigned long *size_out,
 }
 
 static void power_csv_export(bool include_data) {
-  if (!s_card || s_recovery_blocked) {
+  if (!storage_sd_mounted()) {
     printf("LY|SD_EXPORT|event=error result=unavailable reason=sd_not_ready\n");
     fflush(stdout);
     return;
@@ -399,7 +353,7 @@ static void sd_spi_bus_idle_clocks(void) {
   gpio_set_level(PIN_SD_CS, 1);
 }
 
-static esp_err_t sd_mount_with_retry(bool allow_format) {
+static esp_err_t sd_mount_with_retry(void) {
   static const uint32_t wait_ms[SD_MOUNT_ATTEMPTS] = {200, 250, 500, 1000};
   /* Fixed 20 MHz policy: every retry uses the proven-safe bus rate.  Do not
      briefly switch a marginal card to 40 MHz before falling back. */
@@ -432,9 +386,9 @@ static esp_err_t sd_mount_with_retry(bool allow_format) {
     host.slot = SD_SPI_HOST;
     host.max_freq_khz = frequency;
     esp_vfs_fat_sdmmc_mount_config_t mount = {
-      /* Formatting is enabled only from storage_sd_format(), after an explicit
-         long-press confirmation. Normal boot and all I/O retries are read-only. */
-      .format_if_mount_failed = allow_format,
+      /* Never format automatically. A missing Luoye directory layout is safe
+         to create after mount; an unknown filesystem may still contain data. */
+      .format_if_mount_failed = false,
       .max_files = 8,
       .allocation_unit_size = 32 * 1024,
     };
@@ -486,8 +440,14 @@ static struct {
   volatile bool error_posted;
 } s_sess;
 
-static app_error_t errno_to_write_error(void) {
-  return errno == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_WRITE;
+static app_error_t errno_value_to_write_error(int value) {
+  return value == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_WRITE;
+}
+
+static void report_storage_errno(const char *source, int value) {
+  if (storage_errno_is_io_fault(value)) {
+    storage_sd_report_io_fault(source, ESP_FAIL, value);
+  }
 }
 
 static bool make_dir(const char *path) {
@@ -500,19 +460,34 @@ static bool file_write_all(FILE *file, const void *data, size_t bytes) {
 }
 
 static app_error_t file_sync(FILE *file) {
-  if (!file) return APP_ERR_STORAGE_SYNC;
-  if (fflush(file) != 0) return errno_to_write_error();
+  if (!file || !storage_state_allows_io()) return APP_ERR_STORAGE_SYNC;
+  if (fflush(file) != 0) {
+    int flush_errno = errno;
+    report_storage_errno("fflush", flush_errno);
+    return errno_value_to_write_error(flush_errno);
+  }
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_SYNC;
   int fd = fileno(file);
   if (fd < 0 || fsync(fd) != 0) {
-    return errno == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_SYNC;
+    int sync_errno = errno;
+    report_storage_errno("fsync", sync_errno);
+    return sync_errno == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_SYNC;
   }
   return APP_ERR_NONE;
 }
 
 static app_error_t file_sync_close(FILE *file) {
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_CLOSE;
   app_error_t result = file_sync(file);
+  if (storage_sd_faulted()) {
+    /* A writable FILE may flush FAT metadata from fclose.  Once the command
+       stream is faulted, leave the handle for reboot cleanup instead. */
+    return result == APP_ERR_NONE ? APP_ERR_STORAGE_CLOSE : result;
+  }
   if (fclose(file) != 0 && result == APP_ERR_NONE) {
-    result = errno == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_CLOSE;
+    int close_errno = errno;
+    report_storage_errno("fclose", close_errno);
+    result = close_errno == ENOSPC ? APP_ERR_SD_FULL : APP_ERR_STORAGE_CLOSE;
   }
   return result;
 }
@@ -585,12 +560,17 @@ static app_error_t range_sha_feed(const void *data, size_t bytes) {
 }
 
 static app_error_t persist_pending_range_sha(void) {
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
   if (!s_sess.pending_sha_ready) return APP_ERR_NONE;
   char path[JSON_PATH_BYTES];
   snprintf(path, sizeof(path), "%s/%s", s_sess.dir,
            SD_UPLOAD_RANGE_HASH_FILE);
   FILE *file = fopen(path, "ab");
-  if (!file) return errno_to_write_error();
+  if (!file) {
+    int open_errno = errno;
+    report_storage_errno("range_hash_open", open_errno);
+    return errno_value_to_write_error(open_errno);
+  }
   char line[112];
   int length = snprintf(line, sizeof(line), "%lu %lu %s\n",
                         (unsigned long)s_sess.pending_sha_offset,
@@ -599,8 +579,11 @@ static app_error_t persist_pending_range_sha(void) {
   app_error_t result = APP_ERR_NONE;
   if (length <= 0 || length >= (int)sizeof(line) ||
       !file_write_all(file, line, (size_t)length)) {
-    result = errno_to_write_error();
+    int write_errno = errno;
+    report_storage_errno("range_hash_write", write_errno);
+    result = errno_value_to_write_error(write_errno);
   }
+  if (storage_sd_faulted()) return result;
   app_error_t close_result = file_sync_close(file);
   if (result == APP_ERR_NONE) result = close_result;
   if (result == APP_ERR_NONE) {
@@ -614,13 +597,28 @@ static app_error_t persist_pending_range_sha(void) {
 }
 
 static app_error_t wav_commit(FILE *file, uint32_t pcm_bytes) {
+  if (!file || !storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
   uint8_t header[LUOYE_WAV_HEADER_BYTES];
   luoye_wav_build_header(header, AUDIO_SAMPLE_RATE, 1, 16, pcm_bytes);
-  if (fseek(file, 0, SEEK_SET) != 0) return APP_ERR_STORAGE_WRITE;
-  if (!file_write_all(file, header, sizeof(header))) return errno_to_write_error();
+  if (fseek(file, 0, SEEK_SET) != 0) {
+    int seek_errno = errno;
+    report_storage_errno("wav_seek_header", seek_errno);
+    return APP_ERR_STORAGE_WRITE;
+  }
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
+  if (!file_write_all(file, header, sizeof(header))) {
+    int write_errno = errno;
+    report_storage_errno("wav_header_write", write_errno);
+    return errno_value_to_write_error(write_errno);
+  }
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
   app_error_t result = file_sync(file);
   if (result != APP_ERR_NONE) return result;
-  if (fseek(file, 0, SEEK_END) != 0) return APP_ERR_STORAGE_WRITE;
+  if (fseek(file, 0, SEEK_END) != 0) {
+    int seek_errno = errno;
+    report_storage_errno("wav_seek_end", seek_errno);
+    return APP_ERR_STORAGE_WRITE;
+  }
   return APP_ERR_NONE;
 }
 
@@ -640,20 +638,42 @@ static void json_set_bool(cJSON *object, const char *name, bool value) {
 }
 
 static app_error_t write_text_file(const char *path, const char *text) {
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
   FILE *file = fopen(path, "wb");
-  if (!file) return errno_to_write_error();
+  if (!file) {
+    int open_errno = errno;
+    report_storage_errno("text_open", open_errno);
+    return errno_value_to_write_error(open_errno);
+  }
   app_error_t result = APP_ERR_NONE;
   size_t bytes = strlen(text);
-  if (!file_write_all(file, text, bytes)) result = errno_to_write_error();
+  if (!file_write_all(file, text, bytes)) {
+    int write_errno = errno;
+    report_storage_errno("text_write", write_errno);
+    result = errno_value_to_write_error(write_errno);
+  }
+  if (storage_sd_faulted()) {
+    return result == APP_ERR_NONE ? APP_ERR_STORAGE_WRITE : result;
+  }
   app_error_t close_result = file_sync_close(file);
   return result != APP_ERR_NONE ? result : close_result;
 }
 
 static app_error_t prepare_card_layout(void) {
-  bool new_card = access(CARD_META_PATH, F_OK) != 0;
+  errno = 0;
+  int meta_access = access(CARD_META_PATH, F_OK);
+  int meta_errno = meta_access == 0 ? 0 : errno;
+  if (meta_access != 0 && meta_errno != ENOENT) {
+    report_storage_errno("card_meta_access", meta_errno);
+    return errno_value_to_write_error(meta_errno);
+  }
+  bool new_card = meta_access != 0;
   if (!make_dir(SESSION_ROOT) || !make_dir(DIAG_ROOT)) {
-    ESP_LOGE(TAG, "LY|STORAGE|event=layout_mkdir_failed errno=%d", errno);
-    return errno_to_write_error();
+    int mkdir_errno = errno;
+    report_storage_errno("layout_mkdir", mkdir_errno);
+    ESP_LOGE(TAG, "LY|STORAGE|event=layout_mkdir_failed errno=%d",
+             mkdir_errno);
+    return errno_value_to_write_error(mkdir_errno);
   }
 
   /* Do a durable create/write/fsync/close/delete probe before recording is
@@ -662,7 +682,7 @@ static app_error_t prepare_card_layout(void) {
   app_error_t result = write_text_file(CARD_PROBE_PATH,
                                        "luoye-storage-write-test\n");
   if (result != APP_ERR_NONE) {
-    unlink(CARD_PROBE_PATH);
+    if (!storage_sd_faulted()) unlink(CARD_PROBE_PATH);
     ESP_LOGE(TAG, "LY|STORAGE|event=write_probe_failed code=%d errno=%d",
              (int)result, errno);
     return result;
@@ -674,17 +694,9 @@ static app_error_t prepare_card_layout(void) {
   }
 
   if (new_card) {
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char manifest[384];
-    snprintf(manifest, sizeof(manifest),
-        "{\"schema\":\"%s\",\"card_uuid\":\"%02X%02X%02X%02X%02X%02X-%08lX\","
-        "\"filesystem\":\"fat32\",\"sector_bytes\":512,\"cluster_bytes\":32768,"
-        "\"directories\":[\"rec\",\"diag\",\"system\"]}\n",
-        CARD_SCHEMA, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        (unsigned long)esp_random());
-    if (!make_dir(MOUNT_POINT "/system")) return errno_to_write_error();
-    result = write_text_file(CARD_META_PATH, manifest);
+    result = write_text_file(
+        CARD_META_PATH,
+        "{\"schema\":\"luoye-storage/1\",\"directories\":[\"rec\",\"diag\"]}\n");
     if (result != APP_ERR_NONE) {
       ESP_LOGE(TAG, "LY|STORAGE|event=card_manifest_failed code=%d",
                (int)result);
@@ -693,45 +705,6 @@ static app_error_t prepare_card_layout(void) {
   }
   ESP_LOGI(TAG, "LY|STORAGE|event=layout_ready new_card=%d rec=1 diag=1",
            new_card);
-  return APP_ERR_NONE;
-}
-
-static bool card_schema_current(void) {
-  FILE *file = fopen(CARD_META_PATH, "rb");
-  if (!file) return false;
-  char text[512] = {0};
-  size_t read = fread(text, 1, sizeof(text) - 1, file);
-  fclose(file);
-  if (!read) return false;
-  cJSON *root = cJSON_Parse(text);
-  cJSON *schema = root ? cJSON_GetObjectItemCaseSensitive(root, "schema") : NULL;
-  bool current = cJSON_IsString(schema) &&
-                 strcmp(schema->valuestring, CARD_SCHEMA) == 0;
-  cJSON_Delete(root);
-  return current;
-}
-
-static app_error_t verify_probe_range(FILE *file, uint8_t *buffer,
-                                      size_t buffer_size, uint32_t offset,
-                                      uint32_t length) {
-  if (storage_sd_seek(file, offset) != ESP_OK) return APP_ERR_STORAGE_WRITE;
-  uint32_t done = 0;
-  while (done < length) {
-    size_t wanted = length - done < buffer_size ? length - done : buffer_size;
-    size_t received = 0;
-    if (storage_sd_read(file, buffer, wanted, &received) != ESP_OK ||
-        received != wanted) {
-      return APP_ERR_STORAGE_WRITE;
-    }
-    for (size_t i = 0; i < wanted; ++i) {
-      uint8_t expected =
-          (uint8_t)((((uint32_t)offset + done + i) * 131U + 0x5AU) & 0xffU);
-      if (buffer[i] != expected) return APP_ERR_STORAGE_WRITE;
-    }
-    done += (uint32_t)wanted;
-  }
-  ESP_LOGI(TAG, "LY|STORAGE_SELFTEST|offset=%lu bytes=%lu result=ok",
-           (unsigned long)offset, (unsigned long)length);
   return APP_ERR_NONE;
 }
 
@@ -746,11 +719,18 @@ static app_error_t sd_speed_probe(void) {
        unusable. The normal recording path remains independently checked. */
     return APP_ERR_NONE;
   }
-  unlink(CARD_SPEED_PROBE_PATH);
+  if (unlink(CARD_SPEED_PROBE_PATH) != 0 && errno != ENOENT) {
+    int unlink_errno = errno;
+    report_storage_errno("speed_probe_preclean", unlink_errno);
+    free(buffer);
+    return errno_value_to_write_error(unlink_errno);
+  }
   FILE *file = fopen(CARD_SPEED_PROBE_PATH, "wb");
   if (!file) {
+    int open_errno = errno;
+    report_storage_errno("speed_probe_write_open", open_errno);
     free(buffer);
-    return errno_to_write_error();
+    return errno_value_to_write_error(open_errno);
   }
   app_error_t result = APP_ERR_NONE;
   int64_t write_started_us = esp_timer_get_time();
@@ -759,7 +739,9 @@ static app_error_t sd_speed_probe(void) {
       buffer[i] = (uint8_t)(((offset + i) * 131U + 0x5AU) & 0xffU);
     }
     if (!file_write_all(file, buffer, PROBE_BLOCK_BYTES)) {
-      result = errno_to_write_error();
+      int write_errno = errno;
+      report_storage_errno("speed_probe_write", write_errno);
+      result = errno_value_to_write_error(write_errno);
       break;
     }
   }
@@ -771,14 +753,19 @@ static app_error_t sd_speed_probe(void) {
   if (result == APP_ERR_NONE) {
     file = fopen(CARD_SPEED_PROBE_PATH, "rb");
     if (!file) {
+      report_storage_errno("speed_probe_read_open", errno);
       result = APP_ERR_STORAGE_OPEN;
     } else {
       int64_t read_started_us = esp_timer_get_time();
       for (uint32_t offset = 0; offset < PROBE_TOTAL_BYTES;
            offset += PROBE_BLOCK_BYTES) {
         size_t received = 0;
-        if (storage_sd_read(file, buffer, PROBE_BLOCK_BYTES, &received) != ESP_OK ||
-            received != PROBE_BLOCK_BYTES) {
+        esp_err_t read_result =
+            storage_sd_read(file, buffer, PROBE_BLOCK_BYTES, &received);
+        if (read_result != ESP_OK || received != PROBE_BLOCK_BYTES) {
+          if (!storage_sd_faulted()) {
+            storage_sd_report_io_fault("speed_probe_read", read_result, 0);
+          }
           result = APP_ERR_STORAGE_WRITE;
           break;
         }
@@ -786,26 +773,24 @@ static app_error_t sd_speed_probe(void) {
           uint8_t expected =
               (uint8_t)(((offset + i) * 131U + 0x5AU) & 0xffU);
           if (buffer[i] != expected) {
+            storage_sd_report_io_fault("speed_probe_compare",
+                                       ESP_ERR_INVALID_CRC, 0);
             result = APP_ERR_STORAGE_WRITE;
             break;
           }
         }
         if (result != APP_ERR_NONE) break;
       }
-      static const struct { uint32_t offset; uint32_t length; } cases[] = {
-        {0, 512}, {1, 509}, {44, 511}, {511, 516},
-        {512, 16 * 1024}, {4096, 64 * 1024},
-      };
-      for (size_t i = 0; result == APP_ERR_NONE &&
-                         i < sizeof(cases) / sizeof(cases[0]); ++i) {
-        result = verify_probe_range(file, buffer, PROBE_BLOCK_BYTES,
-                                    cases[i].offset, cases[i].length);
-      }
       read_us = (uint64_t)(esp_timer_get_time() - read_started_us);
-      fclose(file);
+      if (!storage_sd_faulted()) fclose(file);
     }
   }
-  unlink(CARD_SPEED_PROBE_PATH);
+  if (!storage_sd_faulted()) {
+    unlink(CARD_SPEED_PROBE_PATH);
+  } else {
+    ESP_LOGW(TAG,
+             "LY|STORAGE_PERF|event=probe_cleanup_skipped reason=storage_fault");
+  }
   free(buffer);
   ESP_LOGI(TAG,
            "LY|STORAGE_PERF|event=probe result=%d freq_khz=%lu bytes=%u write_Bps=%llu read_Bps=%llu",
@@ -816,6 +801,7 @@ static app_error_t sd_speed_probe(void) {
 }
 
 static app_error_t write_json_atomic(const char *path, cJSON *root) {
+  if (!storage_state_allows_io()) return APP_ERR_STORAGE_WRITE;
   char *json = cJSON_PrintUnformatted(root);
   if (!json) return APP_ERR_STORAGE_WRITE;
   cJSON *validation = cJSON_Parse(json);
@@ -834,19 +820,43 @@ static app_error_t write_json_atomic(const char *path, cJSON *root) {
   app_error_t result = write_text_file(temp, json);
   cJSON_free(json);
   if (result != APP_ERR_NONE) {
-    unlink(temp);
+    if (!storage_sd_faulted()) unlink(temp);
     return result;
   }
 
-  unlink(backup);
-  bool had_current = access(path, F_OK) == 0;
-  if (had_current && rename(path, backup) != 0) {
-    unlink(temp);
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_WRITE;
+
+  if (unlink(backup) != 0 && errno != ENOENT) {
+    int unlink_errno = errno;
+    report_storage_errno("manifest_backup_unlink", unlink_errno);
+    if (!storage_sd_faulted()) unlink(temp);
     return APP_ERR_STORAGE_WRITE;
   }
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_WRITE;
+  errno = 0;
+  int access_result = access(path, F_OK);
+  int access_errno = access_result == 0 ? 0 : errno;
+  if (access_result != 0 && access_errno != ENOENT) {
+    report_storage_errno("manifest_current_access", access_errno);
+    if (!storage_sd_faulted()) unlink(temp);
+    return APP_ERR_STORAGE_WRITE;
+  }
+  bool had_current = access_result == 0;
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_WRITE;
+  if (had_current && rename(path, backup) != 0) {
+    int rename_errno = errno;
+    report_storage_errno("manifest_backup_rename", rename_errno);
+    if (!storage_sd_faulted()) unlink(temp);
+    return APP_ERR_STORAGE_WRITE;
+  }
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_WRITE;
   if (rename(temp, path) != 0) {
-    if (had_current) rename(backup, path);
-    unlink(temp);
+    int rename_errno = errno;
+    report_storage_errno("manifest_commit_rename", rename_errno);
+    if (!storage_sd_faulted()) {
+      if (had_current) rename(backup, path);
+      unlink(temp);
+    }
     return APP_ERR_STORAGE_WRITE;
   }
   return APP_ERR_NONE;
@@ -855,21 +865,24 @@ static app_error_t write_json_atomic(const char *path, cJSON *root) {
 static cJSON *read_json(const char *path) {
   FILE *file = fopen(path, "rb");
   if (!file) return NULL;
-  size_t length = 0;
-  if (storage_sd_size(file, &length) != ESP_OK || length > 64 * 1024U ||
-      storage_sd_seek(file, 0) != ESP_OK) {
+  if (fseek(file, 0, SEEK_END) != 0) {
     fclose(file);
     return NULL;
   }
-  char *buffer = malloc(length + 1U);
+  long length = ftell(file);
+  if (length < 0 || length > 64 * 1024 || fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    return NULL;
+  }
+  char *buffer = malloc((size_t)length + 1);
   if (!buffer) {
     fclose(file);
     return NULL;
   }
   size_t read = 0;
-  esp_err_t read_result = storage_sd_read(file, buffer, length, &read);
+  esp_err_t read_result = storage_sd_read(file, buffer, (size_t)length, &read);
   fclose(file);
-  if (read_result != ESP_OK || read != length) {
+  if (read_result != ESP_OK || read != (size_t)length) {
     free(buffer);
     return NULL;
   }
@@ -930,6 +943,7 @@ static app_error_t write_session_manifest(const char *state,
   char path[JSON_PATH_BYTES];
   snprintf(path, sizeof(path), "%s/session.json", s_sess.dir);
   cJSON *root = read_json(path);
+  if (storage_sd_faulted()) return APP_ERR_STORAGE_WRITE;
   if (!root) root = new_manifest(s_sess.id, s_sess.scene, s_sess.title);
   if (!root) return APP_ERR_STORAGE_WRITE;
 
@@ -973,7 +987,11 @@ static app_error_t write_session_manifest(const char *state,
   return result;
 }
 
-static void post_storage_error(app_error_t error, const char *phase) {
+static void post_storage_error(app_error_t error, const char *phase,
+                               int io_errno) {
+  if (storage_errno_is_io_fault(io_errno)) {
+    storage_sd_report_io_fault(phase, ESP_FAIL, io_errno);
+  }
   if (error == APP_ERR_NONE) error = APP_ERR_STORAGE_WRITE;
   xSemaphoreTake(s_lock, portMAX_DELAY);
   s_sess.error = error;
@@ -982,7 +1000,7 @@ static void post_storage_error(app_error_t error, const char *phase) {
   s_sess.error_posted = true;
   xSemaphoreGive(s_lock);
   ESP_LOGE(TAG, "LY|STORAGE|event=error phase=%s code=%d errno=%d",
-           phase, (int)error, errno);
+           phase, (int)error, io_errno);
   if (should_post && s_post) s_post(APP_EV_STORAGE_ERROR, error);
 }
 
@@ -1020,7 +1038,7 @@ app_error_t sd_session_open(const char *session_id,
                             app_scene_t scene,
                             const char *title) {
   if (!s_card) return APP_ERR_NO_SD;
-  if (s_recovery_blocked) return APP_ERR_RECOVERY;
+  if (!storage_sd_mounted()) return APP_ERR_RECOVERY;
   if (!session_id || !*session_id || s_sess.open) return APP_ERR_BUSY;
 
   memset(&s_sess, 0, sizeof(s_sess));
@@ -1031,16 +1049,22 @@ app_error_t sd_session_open(const char *session_id,
   s_sess.close_reason = APP_CLOSE_USER;
 
   if (!make_dir(SESSION_ROOT) || !make_dir(s_sess.dir)) {
-    return errno_to_write_error();
+    int mkdir_errno = errno;
+    report_storage_errno("session_mkdir", mkdir_errno);
+    return errno_value_to_write_error(mkdir_errno);
   }
 
   char path[JSON_PATH_BYTES];
   snprintf(path, sizeof(path), "%s/audio.wav", s_sess.dir);
   s_sess.wav = fopen(path, "wb");
-  if (!s_sess.wav) return errno_to_write_error();
+  if (!s_sess.wav) {
+    int open_errno = errno;
+    report_storage_errno("session_audio_open", open_errno);
+    return errno_value_to_write_error(open_errno);
+  }
   app_error_t result = wav_commit(s_sess.wav, 0);
   if (result != APP_ERR_NONE) {
-    fclose(s_sess.wav);
+    if (!storage_sd_faulted()) fclose(s_sess.wav);
     s_sess.wav = NULL;
     return result;
   }
@@ -1110,7 +1134,7 @@ app_error_t sd_session_close_status(void) {
 }
 
 esp_err_t sd_session_mark(const char *kind, int64_t at_ms) {
-  if (!s_sess.open) return ESP_ERR_INVALID_STATE;
+  if (!s_sess.open || !storage_sd_mounted()) return ESP_ERR_INVALID_STATE;
   char path[JSON_PATH_BYTES], line[128];
   snprintf(path, sizeof(path), "%s/marks.jsonl", s_sess.dir);
   int length = snprintf(line, sizeof(line),
@@ -1119,15 +1143,24 @@ esp_err_t sd_session_mark(const char *kind, int64_t at_ms) {
   if (length <= 0 || length >= (int)sizeof(line)) return ESP_ERR_INVALID_SIZE;
   FILE *file = fopen(path, "ab");
   if (!file) {
-    post_storage_error(errno_to_write_error(), "mark_open");
+    int open_errno = errno;
+    post_storage_error(errno_value_to_write_error(open_errno), "mark_open",
+                       open_errno);
     return ESP_FAIL;
   }
   app_error_t result = APP_ERR_NONE;
-  if (!file_write_all(file, line, (size_t)length)) result = errno_to_write_error();
-  app_error_t close_result = file_sync_close(file);
+  int failure_errno = 0;
+  if (!file_write_all(file, line, (size_t)length)) {
+    failure_errno = errno;
+    report_storage_errno("mark_write", failure_errno);
+    result = errno_value_to_write_error(failure_errno);
+  }
+  app_error_t close_result = storage_sd_faulted()
+                                 ? APP_ERR_STORAGE_CLOSE
+                                 : file_sync_close(file);
   if (result == APP_ERR_NONE) result = close_result;
   if (result != APP_ERR_NONE) {
-    post_storage_error(result, "mark_sync");
+    post_storage_error(result, "mark_sync", failure_errno);
     return ESP_FAIL;
   }
   return ESP_OK;
@@ -1155,16 +1188,19 @@ bool sd_session_current(char *dir_out, size_t dir_len,
 }
 
 static void finish_session(void) {
+  if (storage_sd_faulted()) goto faulted;
   app_error_t hash_result = range_sha_finish(false);
   if (hash_result != APP_ERR_NONE) {
     range_sha_disable("finish", hash_result);
   }
   app_error_t result = wav_commit(s_sess.wav, s_sess.data_bytes);
+  if (storage_sd_faulted()) goto faulted;
   if (result == APP_ERR_NONE) {
     __atomic_store_n(&s_sess.committed_bytes, s_sess.data_bytes, __ATOMIC_RELEASE);
   }
   if (result == APP_ERR_NONE && s_sess.pending_sha_ready) {
     hash_result = persist_pending_range_sha();
+    if (storage_sd_faulted()) goto faulted;
     if (hash_result != APP_ERR_NONE) {
       range_sha_disable("close_sync", hash_result);
     }
@@ -1174,6 +1210,7 @@ static void finish_session(void) {
     s_sess.range_sha_active = false;
   }
   app_error_t close_result = file_sync_close(s_sess.wav);
+  if (storage_sd_faulted()) goto faulted;
   s_sess.wav = NULL;
   if (result == APP_ERR_NONE) result = close_result;
 
@@ -1184,6 +1221,7 @@ static void finish_session(void) {
   app_error_t manifest_result = write_session_manifest(
       success ? "local_closed" : "local_error",
       s_sess.close_reason, result);
+  if (storage_sd_faulted()) goto faulted;
   if (result == APP_ERR_NONE) result = manifest_result;
 
   if (result != APP_ERR_NONE) s_sess.error = result;
@@ -1196,9 +1234,25 @@ static void finish_session(void) {
              (int)s_sess.close_reason);
     if (s_post) s_post(APP_EV_SESSION_CLOSE_DONE, 0);
   } else {
-    post_storage_error(result, "close");
+    post_storage_error(result, "close", 0);
     if (s_post) s_post(APP_EV_SESSION_SETTLED, 0);
   }
+  return;
+
+faulted:
+  /* Do not attempt WAV repair, fclose, manifest rotation, unlink or rename
+     after a physical SD I/O fault.  The open handle is intentionally left for
+     reboot cleanup; the current boot must perform no more card transactions. */
+  if (s_sess.range_sha_active) {
+    mbedtls_sha256_free(&s_sess.range_sha);
+    s_sess.range_sha_active = false;
+  }
+  s_sess.wav = NULL;
+  if (s_sess.error == APP_ERR_NONE) s_sess.error = APP_ERR_STORAGE_WRITE;
+  __atomic_store_n(&s_sess.open, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&s_sess.closed, true, __ATOMIC_RELEASE);
+  post_storage_error(s_sess.error, "close_faulted", 0);
+  if (s_post) s_post(APP_EV_SESSION_SETTLED, 0);
 }
 
 static void writer_task(void *arg) {
@@ -1210,30 +1264,61 @@ static void writer_task(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
+    if (storage_sd_faulted()) {
+      finish_session();
+      since_sync = 0;
+      continue;
+    }
     size_t samples = audio_pdm_read(buffer, WRITE_SAMPLES, 100);
+    if (storage_sd_faulted()) {
+      finish_session();
+      since_sync = 0;
+      continue;
+    }
     if (samples > 0 && s_sess.error == APP_ERR_NONE) {
       size_t written = fwrite(buffer, sizeof(int16_t), samples, s_sess.wav);
       size_t written_bytes = written * sizeof(int16_t);
       s_sess.data_bytes += (uint32_t)written_bytes;
       since_sync += (uint32_t)written_bytes;
       if (written != samples) {
-        post_storage_error(errno_to_write_error(), "pcm_short_write");
+        int write_errno = errno;
+        post_storage_error(errno_value_to_write_error(write_errno),
+                           "pcm_short_write", write_errno);
       } else {
+        if (storage_sd_faulted()) {
+          finish_session();
+          since_sync = 0;
+          continue;
+        }
         app_error_t hash_result = range_sha_feed(buffer, written_bytes);
         if (hash_result != APP_ERR_NONE) {
           range_sha_disable("update", hash_result);
         }
+        if (storage_sd_faulted()) {
+          finish_session();
+          since_sync = 0;
+          continue;
+        }
         if (fflush(s_sess.wav) != 0) {
-          post_storage_error(errno_to_write_error(), "pcm_flush");
+          int flush_errno = errno;
+          post_storage_error(errno_value_to_write_error(flush_errno),
+                             "pcm_flush", flush_errno);
         } else if (since_sync >= SYNC_INTERVAL_BYTES) {
           app_error_t result = wav_commit(s_sess.wav, s_sess.data_bytes);
-          if (result != APP_ERR_NONE) post_storage_error(result, "periodic_sync");
+          if (result != APP_ERR_NONE) {
+            post_storage_error(result, "periodic_sync", 0);
+          }
           else {
             __atomic_store_n(&s_sess.committed_bytes, s_sess.data_bytes,
                              __ATOMIC_RELEASE);
             result = persist_pending_range_sha();
             if (result != APP_ERR_NONE) {
-              range_sha_disable("periodic_sync", result);
+              if (storage_sd_faulted()) {
+                post_storage_error(APP_ERR_STORAGE_WRITE,
+                                   "range_hash_sync", 0);
+              } else {
+                range_sha_disable("periodic_sync", result);
+              }
             }
             since_sync = 0;
           }
@@ -1393,7 +1478,8 @@ static void space_task(void *arg) {
   (void)arg;
   for (;;) {
     uint64_t total = 0, free_bytes = 0;
-    if (esp_vfs_fat_info(MOUNT_POINT, &total, &free_bytes) == ESP_OK &&
+    if (storage_sd_mounted() &&
+        esp_vfs_fat_info(MOUNT_POINT, &total, &free_bytes) == ESP_OK &&
         total > 0 && s_post) {
       s_post(APP_EV_SD_LOW, free_bytes < total / 10);
     }
@@ -1406,19 +1492,36 @@ static void power_diag_task(void *arg) {
   uint32_t last_sequence = 0;
   for (;;) {
     power_diag_sample_t value;
-    if (power_diag_snapshot(&value) && value.sequence != last_sequence) {
+    if (storage_sd_mounted() && power_diag_snapshot(&value) &&
+        value.sequence != last_sequence) {
       last_sequence = value.sequence;
       xSemaphoreTake(s_power_diag_lock, portMAX_DELAY);
+      if (!storage_sd_mounted()) {
+        xSemaphoreGive(s_power_diag_lock);
+        vTaskDelay(pdMS_TO_TICKS(60 * 1000));
+        continue;
+      }
+      errno = 0;
       bool new_file = access(POWER_DIAG_PATH, F_OK) != 0;
+      int access_errno = new_file ? errno : 0;
+      if (new_file && access_errno != ENOENT) {
+        report_storage_errno("power_diag_access", access_errno);
+      }
+      if (storage_sd_faulted()) {
+        xSemaphoreGive(s_power_diag_lock);
+        vTaskDelay(pdMS_TO_TICKS(60 * 1000));
+        continue;
+      }
       FILE *file = fopen(POWER_DIAG_PATH, "ab");
       if (file) {
+        bool write_ok = true;
         if (new_file) {
-          fputs("epoch_utc,uptime_s,sequence,recording,gauge_soc,filtered_soc,displayed_soc,mv,usb,charge_state,bq_ok,bq_phase,ichg_ma,ilim_ma,stat0,stat1,ichg_ctrl,tmr_ilim,sys_reg,max_config,max_hibrt,max_status,max_version,voltage_fallback\n", file);
+          write_ok = fputs("epoch_utc,uptime_s,sequence,recording,gauge_soc,filtered_soc,displayed_soc,mv,usb,charge_state,bq_ok,bq_phase,ichg_ma,ilim_ma,stat0,stat1,ichg_ctrl,tmr_ilim,sys_reg,max_config,max_hibrt,max_status,max_version,voltage_fallback\n", file) >= 0;
         }
         time_t now = time(NULL);
         unsigned long uptime_s = (unsigned long)(xTaskGetTickCount() /
                                                   configTICK_RATE_HZ);
-        fprintf(file,
+        int print_result = write_ok ? fprintf(file,
                 "%lld,%lu,%lu,%d,%d.%02d,%d,%d,%d,%d,%d,%d,%u,%d,%d,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X%02X,0x%02X%02X,0x%02X%02X,0x%02X%02X,%d\n",
                 (long long)now, uptime_s, (unsigned long)value.sequence,
                 sd_session_is_open(),
@@ -1435,13 +1538,30 @@ static void power_diag_task(void *arg) {
                 value.max_hibrt[0], value.max_hibrt[1],
                 value.max_status[0], value.max_status[1],
                 value.max_version[0], value.max_version[1],
-                value.voltage_fallback);
-        if (fflush(file) != 0) {
-          ESP_LOGW(TAG, "LY|POWER_DIAG|event=flush_failed errno=%d", errno);
+                value.voltage_fallback) : -1;
+        if (print_result < 0) {
+          int write_errno = errno;
+          report_storage_errno("power_diag_write", write_errno);
+          ESP_LOGW(TAG, "LY|POWER_DIAG|event=write_failed errno=%d",
+                   write_errno);
+        } else if (fflush(file) != 0) {
+          int flush_errno = errno;
+          report_storage_errno("power_diag_flush", flush_errno);
+          ESP_LOGW(TAG, "LY|POWER_DIAG|event=flush_failed errno=%d",
+                   flush_errno);
         }
-        fclose(file);
+        if (!storage_sd_faulted()) {
+          if (fclose(file) != 0) {
+            int close_errno = errno;
+            report_storage_errno("power_diag_close", close_errno);
+            ESP_LOGW(TAG, "LY|POWER_DIAG|event=close_failed errno=%d",
+                     close_errno);
+          }
+        }
       } else {
-        ESP_LOGW(TAG, "LY|POWER_DIAG|event=open_failed errno=%d", errno);
+        int open_errno = errno;
+        report_storage_errno("power_diag_open", open_errno);
+        ESP_LOGW(TAG, "LY|POWER_DIAG|event=open_failed errno=%d", open_errno);
       }
       xSemaphoreGive(s_power_diag_lock);
     }
@@ -1451,64 +1571,67 @@ static void power_diag_task(void *arg) {
 
 esp_err_t storage_sd_init(storage_post_fn post) {
   s_post = post;
+  s_storage_state = STORAGE_RUNTIME_UNAVAILABLE;
   s_lock = xSemaphoreCreateMutex();
   s_power_diag_lock = xSemaphoreCreateMutex();
   s_dma_read_lock = xSemaphoreCreateMutex();
-  if (!s_lock || !s_power_diag_lock || !s_dma_read_lock) {
+  s_dma_read_buffer = heap_caps_aligned_alloc(
+      64, SD_DMA_READ_BYTES,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (!s_lock || !s_power_diag_lock || !s_dma_read_lock ||
+      !s_dma_read_buffer) {
     ESP_LOGE(TAG,
-             "LY|STORAGE_DMA|event=policy_failed low_water=%u free_internal=%lu largest_dma=%lu",
-             (unsigned)SD_DMA_LOW_WATER_BYTES,
+             "LY|STORAGE_DMA|event=reserve_failed bytes=%u free_internal=%lu largest_dma=%lu",
+             (unsigned)SD_DMA_READ_BYTES,
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     return ESP_ERR_NO_MEM;
   }
   ESP_LOGI(TAG,
-           "LY|STORAGE_DMA|event=policy mode=direct low_water=%u timeout_ms=%u free_internal=%lu largest_dma=%lu",
-           (unsigned)SD_DMA_LOW_WATER_BYTES,
-           (unsigned)SD_DMA_LOW_WATER_TIMEOUT_MS,
-           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+           "LY|STORAGE_DMA|event=reserved bytes=%u address=%p free_internal=%lu",
+           (unsigned)SD_DMA_READ_BYTES, s_dma_read_buffer,
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-  s_storage_ready = false;
-  esp_err_t error = sd_mount_with_retry(false);
+  esp_err_t error = sd_mount_with_retry();
   if (error != ESP_OK) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     ESP_LOGE(TAG, "LY|STORAGE|event=mount_failed attempts=%u esp=%s",
              SD_MOUNT_ATTEMPTS, esp_err_to_name(error));
     return error;
   }
+  s_storage_state = STORAGE_RUNTIME_INITIALIZING;
   ESP_LOGI(TAG, "LY|STORAGE|event=mounted size_mb=%llu",
            ((uint64_t)s_card->csd.capacity * s_card->csd.sector_size) >> 20);
-
-  if (s_card->csd.sector_size != 512 || !card_schema_current()) {
-    ESP_LOGW(TAG,
-             "LY|STORAGE|event=initialization_required schema=%s sector=%u action=long_press_record",
-             CARD_SCHEMA, (unsigned)s_card->csd.sector_size);
-    if (s_post) s_post(APP_EV_STORAGE_ERROR, APP_ERR_STORAGE_FORMAT_REQUIRED);
-    return ESP_ERR_INVALID_VERSION;
-  }
 
   app_error_t layout = prepare_card_layout();
   app_error_t speed = layout == APP_ERR_NONE ? sd_speed_probe() : layout;
   if (layout != APP_ERR_NONE || speed != APP_ERR_NONE) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     return ESP_ERR_INVALID_STATE;
   }
 
   app_error_t recovery = recover_incomplete_sessions();
-  s_recovery_blocked = recovery != APP_ERR_NONE;
-  if (s_recovery_blocked) {
+  if (recovery != APP_ERR_NONE) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     ESP_LOGE(TAG, "LY|STORAGE|event=recovery_blocked code=%d", (int)recovery);
     return ESP_ERR_INVALID_STATE;
   }
   error = sd_upload_store_init();
-  if (error != ESP_OK) return error;
+  if (error != ESP_OK) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
+    return error;
+  }
   if (xTaskCreatePinnedToCore(writer_task, "sd_writer", 6144, NULL, 15,
                               NULL, 0) != pdPASS) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     return ESP_ERR_NO_MEM;
   }
   if (xTaskCreate(space_task, "sd_space", 3072, NULL, 3, NULL) != pdPASS) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     return ESP_ERR_NO_MEM;
   }
   if (xTaskCreate(power_diag_task, "power_diag", 4096, NULL, 2, NULL) != pdPASS) {
+    s_storage_state = STORAGE_RUNTIME_FAULTED;
     return ESP_ERR_NO_MEM;
   }
   usb_serial_jtag_driver_config_t usb_config =
@@ -1524,45 +1647,11 @@ esp_err_t storage_sd_init(storage_post_fn post) {
     ESP_LOGW(TAG, "LY|SD_EXPORT|event=usb_driver_failed esp=%s",
              esp_err_to_name(usb_error));
   }
-  s_storage_ready = true;
+  s_storage_state = STORAGE_RUNTIME_READY;
+  ESP_LOGI(TAG, "LY|STORAGE|event=runtime_ready state=READY");
   return ESP_OK;
 }
 
 bool storage_sd_mounted(void) {
-  return s_card != NULL && s_storage_ready && !s_recovery_blocked;
-}
-
-esp_err_t storage_sd_format(void) {
-  if (s_format_in_progress || sd_session_is_open()) return ESP_ERR_INVALID_STATE;
-  s_format_in_progress = true;
-  s_storage_ready = false;
-  esp_err_t error = ESP_OK;
-  if (!s_card) error = sd_mount_with_retry(true);
-  if (error == ESP_OK && s_card) {
-    esp_vfs_fat_mount_config_t format = {
-      .format_if_mount_failed = false,
-      .max_files = 8,
-      .allocation_unit_size = 32 * 1024,
-      .disk_status_check_enable = true,
-      .use_one_fat = false,
-    };
-    ESP_LOGW(TAG, "LY|STORAGE_FORMAT|event=begin filesystem=fat32 cluster=32768 destructive=1");
-    error = esp_vfs_fat_sdcard_format_cfg(MOUNT_POINT, s_card, &format);
-  }
-  app_error_t layout = error == ESP_OK ? prepare_card_layout()
-                                       : APP_ERR_STORAGE_WRITE;
-  app_error_t selftest = layout == APP_ERR_NONE ? sd_speed_probe() : layout;
-  if (error == ESP_OK && layout == APP_ERR_NONE && selftest == APP_ERR_NONE &&
-      card_schema_current()) {
-    s_recovery_blocked = false;
-    s_storage_ready = true;
-    ESP_LOGI(TAG, "LY|STORAGE_FORMAT|event=complete schema=%s result=ESP_OK",
-             CARD_SCHEMA);
-    return ESP_OK;
-  }
-  s_format_in_progress = false;
-  ESP_LOGE(TAG,
-           "LY|STORAGE_FORMAT|event=failed esp=%s layout=%d selftest=%d",
-           esp_err_to_name(error), (int)layout, (int)selftest);
-  return error != ESP_OK ? error : ESP_FAIL;
+  return s_card != NULL && s_storage_state == STORAGE_RUNTIME_READY;
 }

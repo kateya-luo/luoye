@@ -42,6 +42,7 @@ class MeetingLifecycle:
         self._audio_events: dict[str, asyncio.Event] = {}
         self.ended: set[str] = set()
         self.finalizing: dict[str, Any] = {}              # 已结束、等残余补洞+最终纪要的 Session
+        self.canonical_sessions: set[str] = set()         # 网页录音结束后必须整场离线定稿
         # server 重启后没有内存 Session；这里保留尚未收到音频的持久化洞，迟到分片到齐后继续补洞。
         self.recovering_gaps: dict[str, set[tuple[int, int]]] = {}
         self.recovery_fallback_seconds = max(60, int(os.getenv("RECOVERY_GAP_FALLBACK_SECONDS", "86400")))
@@ -77,11 +78,13 @@ class MeetingLifecycle:
                 await self.queue.enqueue(session_id, gap[0], gap[1], "gap")
             if not pending:
                 self.recovering_gaps.pop(session_id, None)
-                await self.queue.enqueue(session_id, 0, 0, "summarize")
+                await self._enqueue_finish_jobs(session_id)
 
     # ---- 音频完整（final=1）----
     async def on_audio_complete(self, session_id: str, end_ms: int) -> None:
         self.audio_complete[session_id] = end_ms
+        if self.storage is not None:
+            self.storage.set_audio_end(session_id, end_ms)
         self._audio_events.setdefault(session_id, asyncio.Event()).set()
         await self.on_upload_progress(session_id)   # 尾片也可能正好补齐某个洞
         await self._maybe_schedule_residual(session_id)
@@ -105,10 +108,12 @@ class MeetingLifecycle:
     def finish_inline(self, session_id: str) -> None:
         self._cleanup(session_id)
 
-    async def defer_finalize(self, session_id: str, session: Any) -> None:
-        """挂入 finalizing：等音频完整后转残余洞，再由哨兵出最终纪要。"""
+    async def defer_finalize(self, session_id: str, session: Any, *, canonical: bool = False) -> None:
+        """挂入 finalizing：等音频完整后补洞、整场定稿，最后发布转写。"""
         self.ended.add(session_id)
         self.finalizing[session_id] = session
+        if canonical:
+            self.canonical_sessions.add(session_id)
         await self._maybe_schedule_residual(session_id)
         if session_id not in self.audio_complete:
             asyncio.create_task(self._force_finalize_later(session_id))
@@ -121,14 +126,19 @@ class MeetingLifecycle:
             for gap in list(s.pending_gaps):   # 音频已完整，所有注册过的洞都可转
                 s.pending_gaps.remove(gap)
                 await self.queue.enqueue(session_id, gap[0], gap[1], "gap")
-        await self.queue.enqueue(session_id, 0, 0, "summarize")
+        await self._enqueue_finish_jobs(session_id)
+
+    async def _enqueue_finish_jobs(self, session_id: str) -> None:
+        if session_id in self.canonical_sessions:
+            await self.queue.enqueue(session_id, 0, 0, "canonical")
+        await self.queue.enqueue(session_id, 0, 0, "publish")
 
     async def _force_finalize_later(self, session_id: str) -> None:
         """兜底：客户端结束后死掉、final 分片永远不来 → 超时后用现有内容出纪要，不让历史页卡在'生成中'。"""
         await asyncio.sleep(self.orphan_timeout)
         if session_id in self.finalizing and session_id not in self.audio_complete:
             logger.warning("finalize_forced session_id=%s (final chunk never arrived)", session_id)
-            await self.queue.enqueue(session_id, 0, 0, "summarize")
+            await self.queue.enqueue(session_id, 0, 0, "publish")
 
     def pop_finalizing(self, session_id: str):
         s = self.finalizing.pop(session_id, None)
@@ -139,6 +149,7 @@ class MeetingLifecycle:
         self.audio_complete.pop(session_id, None)
         self._audio_events.pop(session_id, None)
         self.ended.discard(session_id)
+        self.canonical_sessions.discard(session_id)
         self.recovering_gaps.pop(session_id, None)
 
     # ---- 重启恢复（server 崩溃/重启后由 startup 调度）----
@@ -153,6 +164,10 @@ class MeetingLifecycle:
             if self.sessions.get(sid) or sid in self.sessions.suspended or sid in self.finalizing:
                 continue   # 有活体在管，别插手
             waiting: set[tuple[int, int]] = set()
+            needs_canonical = bool(
+                getattr(self.storage, "needs_canonical_finalization", lambda _sid: False)(sid))
+            if needs_canonical:
+                self.canonical_sessions.add(sid)
             for _, s, e in self.storage.list_gaps(sid):
                 if self.coverage.contains(sid, s, e):
                     await self.queue.enqueue(sid, s, e, "gap")
@@ -163,7 +178,7 @@ class MeetingLifecycle:
                 self.recovering_gaps[sid] = waiting
                 asyncio.create_task(self._summarize_recovery_after_timeout(sid))
             else:
-                await self.queue.enqueue(sid, 0, 0, "summarize")
+                await self._enqueue_finish_jobs(sid)
             self.storage.set_state(sid, "finalizing")
             logger.info("recovered_unfinished session_id=%s prev_state=%s waiting_gaps=%d",
                         sid, m["state"], len(waiting))
@@ -175,4 +190,4 @@ class MeetingLifecycle:
             self._recovery_fallback_sent.add(session_id)
             logger.warning("recovery_gap_timeout session_id=%s pending=%d",
                            session_id, len(self.recovering_gaps[session_id]))
-            await self.queue.enqueue(session_id, 0, 0, "summarize")
+            await self.queue.enqueue(session_id, 0, 0, "publish")

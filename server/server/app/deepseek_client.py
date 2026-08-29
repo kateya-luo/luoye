@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -13,6 +14,149 @@ class DeepSeekClient:
     def __init__(self):
         self.key = os.getenv("DEEPSEEK_API_KEY", "")
         self.base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+
+    async def generate_template_minutes(
+        self, transcript: str, template: dict[str, Any], *,
+        meeting_context: dict[str, Any] | None = None,
+        memory_context: dict[str, Any] | None = None,
+        output_language: str = "zh",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate one post-meeting document in one paid request.
+
+        Rolling and automatic-final paths deliberately never call this method.
+        The caller persists the transcript/template hash for idempotency.
+        """
+        transcript = (transcript or "").strip()
+        if not transcript:
+            raise ValueError("会议转写为空，不能生成纪要")
+        if not self.key:
+            raise RuntimeError("服务器尚未配置 DEEPSEEK_API_KEY")
+        model = os.getenv("DEEPSEEK_MINUTES_MODEL", "deepseek-v4-flash")
+        sections = template.get("sections") or []
+        common_rules = "\n- ".join(template.get("common_rules") or [])
+        system_prompt = f"""你是严谨的会议文档秘书。只根据本次会议完整转写、用户确认的人员映射和明确标为历史背景的记忆，生成一次性正式会议纪要。
+输出语言：{output_language}。模板：{template.get('name')}。
+适用场景：{template.get('description')}
+重点提炼：{template.get('focus')}
+建议结构：{template.get('structure')}
+特别规则：{template.get('special_rule')}
+统一规则：
+- {common_rules}
+- 历史背景不能升级成本次会议决定，除非本次转写再次明确确认。
+- 说话人姓名只使用人员映射；没有映射时保留“说话人 N”，不得猜测身份。
+- memory_candidates 仅提取值得跨会议复用的候选事实，最终仍需用户确认。
+只返回一个 JSON 对象，不要 Markdown，不要解释，形状必须为：
+{{
+  "title":"短标题",
+  "summary":"3至6句话摘要",
+  "sections":[{{"heading":"模板章节名","items":["事实、观点或结论"]}}],
+  "conclusions":{{"decisions":[],"consensus":[],"tendencies":[],"suggestions":[],"disagreements":[],"unresolved":[]}},
+  "action_items":[{{"task":"","assignee":"待确认","collaborators":[],"deliverable":"待确认","deadline":"待确认","closure_standard":"待确认","status":"未开始"}}],
+  "participants":[{{"name":"","role":""}}],
+  "memory_candidates":[{{"kind":"term|decision|project_fact|preference","content":"","evidence":"本次转写中的简短依据"}}]
+}}
+sections 必须优先使用这些章节名称：{json.dumps(sections, ensure_ascii=False)}。
+没有依据的章节返回空 items；不得为了填满模板编造内容。"""
+        payload = {
+            "meeting": meeting_context or {},
+            "confirmed_memory_background": memory_context or {},
+            "transcript": transcript,
+        }
+        started = time.monotonic()
+        timeout = float(os.getenv("DEEPSEEK_MINUTES_TIMEOUT_SECONDS", "180"))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{self.base}/chat/completions",
+                headers={"Authorization": f"Bearer {self.key}"},
+                json={"model": model, "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": system_prompt},
+                                   {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                      "temperature": 0.1},
+            )
+            response.raise_for_status()
+            body = response.json()
+        choice = (body.get("choices") or [{}])[0]
+        finish_reason = str(choice.get("finish_reason") or "")
+        if finish_reason not in {"stop", "end_turn"}:
+            raise RuntimeError(f"DeepSeek 输出未完整结束：{finish_reason or 'unknown'}")
+        content = str((choice.get("message") or {}).get("content") or "")
+        result = self._parse_template_minutes(content, template)
+        usage = body.get("usage") or {}
+        metrics = {
+            "model": str(body.get("model") or model),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "cache_hit_tokens": int(usage.get("prompt_cache_hit_tokens") or 0),
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "finish_reason": finish_reason,
+        }
+        return result, metrics
+
+    @staticmethod
+    def _parse_template_minutes(content: str, template: dict[str, Any]) -> dict[str, Any]:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
+        payload = json.loads(cleaned)
+        if not isinstance(payload, dict):
+            raise ValueError("DeepSeek 纪要不是 JSON 对象")
+        normalized_sections = []
+        for item in payload.get("sections") or []:
+            if not isinstance(item, dict):
+                continue
+            heading = str(item.get("heading") or "").strip()[:80]
+            values = [str(value).strip()[:1000] for value in (item.get("items") or [])
+                      if str(value).strip()]
+            if heading:
+                normalized_sections.append({"heading": heading, "items": values})
+        conclusions = payload.get("conclusions") if isinstance(payload.get("conclusions"), dict) else {}
+        conclusion_keys = ("decisions", "consensus", "tendencies", "suggestions",
+                           "disagreements", "unresolved")
+        normalized_conclusions = {
+            key: [str(value).strip()[:1000] for value in (conclusions.get(key) or [])
+                  if str(value).strip()]
+            for key in conclusion_keys
+        }
+        actions = []
+        for item in payload.get("action_items") or []:
+            if not isinstance(item, dict) or not str(item.get("task") or "").strip():
+                continue
+            actions.append({
+                "task": str(item.get("task")).strip()[:1000],
+                "assignee": str(item.get("assignee") or "待确认").strip()[:100],
+                "collaborators": [str(v).strip()[:100] for v in (item.get("collaborators") or []) if str(v).strip()],
+                "deliverable": str(item.get("deliverable") or "待确认").strip()[:500],
+                "deadline": str(item.get("deadline") or "待确认").strip()[:100],
+                "closure_standard": str(item.get("closure_standard") or "待确认").strip()[:500],
+                "status": str(item.get("status") or "未开始").strip()[:50],
+            })
+        candidates = []
+        for item in payload.get("memory_candidates") or []:
+            if isinstance(item, dict) and str(item.get("content") or "").strip():
+                candidates.append({
+                    "kind": str(item.get("kind") or "project_fact")[:40],
+                    "content": str(item.get("content")).strip()[:1000],
+                    "evidence": str(item.get("evidence") or "").strip()[:500],
+                    "confirmed": False,
+                })
+        summary = str(payload.get("summary") or "").strip()
+        if not summary:
+            raise ValueError("DeepSeek 纪要缺少 summary")
+        return {
+            "schema_version": 1,
+            "template": {"id": template["id"], "version": template["version"],
+                         "name": template["name"], "category": template["category"]},
+            "title": str(payload.get("title") or template["name"]).strip()[:200],
+            "summary": summary[:6000],
+            "sections": normalized_sections,
+            "conclusions": normalized_conclusions,
+            # Compatibility fields for existing exports and older clients.
+            "decisions": normalized_conclusions["decisions"],
+            "action_items": actions,
+            "participants": [item for item in (payload.get("participants") or []) if isinstance(item, dict)],
+            "memory_candidates": candidates,
+            "mindmap": {"title": str(payload.get("title") or template["name"])[:100],
+                        "branches": [{"title": s["heading"], "items": s["items"][:5]}
+                                     for s in normalized_sections[:8] if s["items"]]},
+        }
 
     async def summarize(self, transcript: str, *, rolling: bool = False,
                         source_language: str = "auto", output_language: str = "auto") -> dict[str, Any]:
