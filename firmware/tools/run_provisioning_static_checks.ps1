@@ -149,9 +149,9 @@ foreach ($pattern in @('\u8bf7\u63d2\u5165SD\u5361',
     }
 }
 
-if ($cmake -notmatch 'PROJECT_VER\s+"1\.7\.0"' -or
+if ($cmake -notmatch 'PROJECT_VER\s+"1\.7\.1"' -or
     $cmake -notmatch 'luoye-device-api/2') {
-    throw 'Firmware version or API contract does not match v1.7.0.'
+    throw 'Firmware version or API contract does not match v1.7.1.'
 }
 
 Write-Output 'provisioning static checks passed'

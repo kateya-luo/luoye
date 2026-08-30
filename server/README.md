@@ -1,6 +1,6 @@
 # ClearMeeting Server 0.21.0 R9
 
-ClearMeeting 是落叶 ESP32-S3 录音卡配套的自托管服务端与 Web 应用。当前版本与固件 1.7.0 R2 共同使用 `luoye-device-api/2`。
+ClearMeeting 是落叶 ESP32-S3 录音卡配套的自托管服务端与 Web 应用。当前版本与固件 1.7.1 R1 共同使用 `luoye-device-api/2`。
 
 ## 工作流程
 

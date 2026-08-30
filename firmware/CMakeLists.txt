@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 # Luoye firmware release identity. PROJECT_VER is the only firmware-version
 # source; the UI and startup log read the ESP app descriptor generated from it.
-set(PROJECT_VER "1.7.0")
+set(PROJECT_VER "1.7.1")
 set(LUOYE_PRODUCT_NAME "Luoye" CACHE STRING "Internal product name")
 set(LUOYE_PRODUCT_NAME_ZH "落叶" CACHE STRING "Internal product name (Chinese)")
 set(LUOYE_HARDWARE_REV "LY-HW-ENG-20260710" CACHE STRING "Target PCB revision")
@@ -22,7 +22,7 @@ option(LUOYE_ALLOW_INSECURE_HTTP
 
 if(NOT LUOYE_DEVICE_AUTH_PROFILE STREQUAL "engineering")
   message(FATAL_ERROR
-    "Luoye 1.7.0 is frozen to device_auth_profile=engineering")
+    "Luoye 1.7.1 is frozen to device_auth_profile=engineering")
 endif()
 
 if(NOT LUOYE_SERVER_BASE_URL MATCHES "^https?://[A-Za-z0-9.-]+(:[0-9]+)?$")

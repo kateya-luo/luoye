@@ -20,6 +20,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -999,8 +1000,12 @@ static void post_storage_error(app_error_t error, const char *phase,
   bool should_post = !s_sess.error_posted;
   s_sess.error_posted = true;
   xSemaphoreGive(s_lock);
-  ESP_LOGE(TAG, "LY|STORAGE|event=error phase=%s code=%d errno=%d",
-           phase, (int)error, io_errno);
+  ESP_LOGE(TAG,
+           "LY|STORAGE|event=error phase=%s code=%d errno=%d free_internal=%lu free_dma=%lu largest_dma=%lu",
+           phase, (int)error, io_errno,
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
   if (should_post && s_post) s_post(APP_EV_STORAGE_ERROR, error);
 }
 
@@ -1062,6 +1067,22 @@ app_error_t sd_session_open(const char *session_id,
     report_storage_errno("session_audio_open", open_errno);
     return errno_value_to_write_error(open_errno);
   }
+  /* The writer already flushes every 4096-byte PCM block. Newlib's hidden
+     stdio buffer therefore adds no batching, but it may live in PSRAM. That
+     makes ESP-IDF's generic sdmmc layer allocate a temporary 512-byte DMA
+     bounce buffer for every sector flush. Under simultaneous Wi-Fi upload,
+     that runtime allocation can fail and abort an otherwise healthy card.
+     Keep only this live WAV handle unbuffered so fwrite receives the fixed
+     internal DMA-capable writer buffer directly. Offline upload opens its own
+     read-only handle and is intentionally unchanged. */
+  if (setvbuf(s_sess.wav, NULL, _IONBF, 0) != 0) {
+    ESP_LOGE(TAG, "LY|STORAGE|event=wav_unbuffered result=failed");
+    fclose(s_sess.wav);
+    s_sess.wav = NULL;
+    return APP_ERR_STORAGE_WRITE;
+  }
+  ESP_LOGI(TAG, "LY|STORAGE|event=wav_unbuffered result=ok block_bytes=%u",
+           (unsigned)(WRITE_SAMPLES * sizeof(int16_t)));
   app_error_t result = wav_commit(s_sess.wav, 0);
   if (result != APP_ERR_NONE) {
     if (!storage_sd_faulted()) fclose(s_sess.wav);
@@ -1257,7 +1278,7 @@ faulted:
 
 static void writer_task(void *arg) {
   (void)arg;
-  static int16_t buffer[WRITE_SAMPLES];
+  static DMA_ATTR int16_t buffer[WRITE_SAMPLES];
   uint32_t since_sync = 0;
   for (;;) {
     if (!s_sess.open) {

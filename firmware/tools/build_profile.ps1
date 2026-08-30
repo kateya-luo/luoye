@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $idfPy)) {
 }
 $idfVersion = (& python $idfPy --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $idfVersion -notmatch 'v5\.5\.4') {
-    throw "Luoye v1.7.0 requires ESP-IDF v5.5.4; detected: $idfVersion"
+    throw "Luoye v1.7.1 requires ESP-IDF v5.5.4; detected: $idfVersion"
 }
 
 if ($ServerBaseUrl.StartsWith('http://')) {
@@ -35,7 +35,7 @@ if ($ServerBaseUrl.StartsWith('http://')) {
 $allowHttpValue = if ($AllowInsecureHttp) { 'ON' } else { 'OFF' }
 
 if ($Profile -eq 'engineering') {
-    $buildDir = Join-Path $project 'build-v170'
+    $buildDir = Join-Path $project 'build-v171'
     $sdkconfigPath = Join-Path $project 'sdkconfig.ui154'
     $defaults = 'sdkconfig.defaults'
 } else {
@@ -71,7 +71,7 @@ try {
 
     $description = Get-Content -LiteralPath (Join-Path $buildDir 'project_description.json') -Raw |
         ConvertFrom-Json
-    if ($description.project_version -ne '1.7.0') {
+    if ($description.project_version -ne '1.7.1') {
         throw "Embedded version mismatch: $($description.project_version)"
     }
     if ($description.target -ne 'esp32s3') {

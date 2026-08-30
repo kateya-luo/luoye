@@ -90,7 +90,10 @@ for ($extraData = 0; $extraData -le 7; $extraData++) {
 
 foreach ($required in @('event=probe_cleanup_skipped reason=storage_fault',
                          'if (!storage_sd_faulted()) unlink(temp)',
-                         'action=block_runtime_io')) {
+                         'action=block_runtime_io',
+                         'setvbuf(s_sess.wav, NULL, _IONBF, 0)',
+                         'static DMA_ATTR int16_t buffer[WRITE_SAMPLES]',
+                         'free_internal=%lu free_dma=%lu largest_dma=%lu')) {
     if (-not $storage.Contains($required)) {
         throw "Missing post-fault zero-mutation guard: $required"
     }

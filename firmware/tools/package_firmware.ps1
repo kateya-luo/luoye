@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$BuildDir = 'build-v170',
-    [string]$ReleaseId = 'luoye-fw-v1.7.0-engineering-sdspi-exact-dma-r2',
-    [string]$ExpectedVersion = '1.7.0',
+    [string]$BuildDir = 'build-v171',
+    [string]$ReleaseId = 'luoye-fw-v1.7.1-engineering-wav-dma-r1',
+    [string]$ExpectedVersion = '1.7.1',
     [ValidateSet('dev', 'rc', 'release', 'engineering')]
     [string]$Profile = 'engineering',
     [string]$HardwareRev = 'LY-HW-ENG-20260710',
