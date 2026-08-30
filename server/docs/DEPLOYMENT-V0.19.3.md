@@ -7,22 +7,22 @@
 ## 1. Windows 上传发布包
 
 ```powershell
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.3-speaker-stability-r1.zip" "luozhou@192.168.31.183:/home/luozhou/"
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.3-speaker-stability-r1.zip.sha256" "luozhou@192.168.31.183:/home/luozhou/"
-& "$env:WINDIR\System32\OpenSSH\ssh.exe" "luozhou@192.168.31.183"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.3-speaker-stability-r1.zip" "deploy@192.0.2.10:/srv/clearmeeting/"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.3-speaker-stability-r1.zip.sha256" "deploy@192.0.2.10:/srv/clearmeeting/"
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" "deploy@192.0.2.10"
 ```
 
 ## 2. Ubuntu 校验、解压并备份
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 sha256sum -c clearmeeting-server-v0.19.3-speaker-stability-r1.zip.sha256
-mkdir -p /home/luozhou/clearmeeting-v0.19.3
-unzip -q clearmeeting-server-v0.19.3-speaker-stability-r1.zip -d /home/luozhou/clearmeeting-v0.19.3
-cd /home/luozhou/clearmeeting-v0.19.3
+mkdir -p /srv/clearmeeting/clearmeeting-v0.19.3
+unzip -q clearmeeting-server-v0.19.3-speaker-stability-r1.zip -d /srv/clearmeeting/clearmeeting-v0.19.3
+cd /srv/clearmeeting/clearmeeting-v0.19.3
 sha256sum -c SHA256SUMS.txt
 
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 cp -a server/data/clearmeeting.db "backups/clearmeeting-before-v0.19.3-$(date +%Y%m%d-%H%M%S).db"
 ```
@@ -30,14 +30,14 @@ cp -a server/data/clearmeeting.db "backups/clearmeeting-before-v0.19.3-$(date +%
 ## 3. 覆盖程序并保留数据和配置
 
 ```bash
-cd /home/luozhou/clearmeeting
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.19.3/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.3/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.3/apps/card-sim/ apps/card-sim/
-rsync -a --delete --exclude '.env' /home/luozhou/clearmeeting-v0.19.3/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.3/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.19.3/package.json .
-cp /home/luozhou/clearmeeting-v0.19.3/package-lock.json .
+cd /srv/clearmeeting/clearmeeting
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.3/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.3/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.3/apps/card-sim/ apps/card-sim/
+rsync -a --delete --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.3/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.3/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.19.3/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.19.3/package-lock.json .
 test -f server/data/clearmeeting.db && echo '数据库仍在：OK'
 test -f deploy/.env && echo '.env 仍在：OK'
 ```
@@ -45,7 +45,7 @@ test -f deploy/.env && echo '.env 仍在：OK'
 ## 4. 写入本版参数
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 set_env() { key="$1"; value="$2"; grep -q "^${key}=" .env && sed -i "s|^${key}=.*|${key}=${value}|" .env || printf '%s=%s\n' "$key" "$value" >> .env; }
 set_env SERVER_RELEASE clearmeeting-server-v0.19.3
 set_env SPEAKER_SIMILARITY_THRESHOLD 0.68
@@ -68,7 +68,7 @@ sed -i '/^SPEAKER_MAX_COUNT=/d' .env
 awk '/MemTotal/ {print "Linux 可见内存：", $2/1024/1024, "GiB"; if ($2 < 15000000) exit 1}' /proc/meminfo \
   || { echo 'Linux 尚未识别完整 16 GiB，停止部署'; exit 1; }
 
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose --profile real-asr config >/dev/null
 docker compose --profile real-asr build --no-cache speaker server nginx
 docker compose --profile real-asr up -d funasr speaker server nginx

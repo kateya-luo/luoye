@@ -25,7 +25,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="ClearMeeting API", version="0.21.0")
+app = FastAPI(title="ClearMeeting API", version="2.0.0")
 configure_auth(storage)  # 绑定用户库并幂等创建 TEST1–TEST5
 _cors_origins = [origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
                  if origin.strip()]

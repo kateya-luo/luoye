@@ -11,10 +11,10 @@
 ```powershell
 cd D:\OPENOP\files-mentioned-by-the-user-chatgpt\clearmeeting\releases
 
-scp .\clearmeeting-server-v0.19.0-semantic-timeline-r1.zip luozhou@192.168.31.183:/home/luozhou/
-scp .\clearmeeting-server-v0.19.0-semantic-timeline-r1.zip.sha256 luozhou@192.168.31.183:/home/luozhou/
+scp .\clearmeeting-server-v0.19.0-semantic-timeline-r1.zip deploy@192.0.2.10:/srv/clearmeeting/
+scp .\clearmeeting-server-v0.19.0-semantic-timeline-r1.zip.sha256 deploy@192.0.2.10:/srv/clearmeeting/
 
-ssh luozhou@192.168.31.183
+ssh deploy@192.0.2.10
 ```
 
 如果 `scp` 或 `ssh` 提示找不到命令，请在“管理员 PowerShell”安装 Windows OpenSSH 客户端：
@@ -30,16 +30,16 @@ Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 成功进入服务器终端后，逐行执行：
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 ls -lh clearmeeting-server-v0.19.0-semantic-timeline-r1.zip*
 
 sed -i 's/\r$//' clearmeeting-server-v0.19.0-semantic-timeline-r1.zip.sha256
 sha256sum -c clearmeeting-server-v0.19.0-semantic-timeline-r1.zip.sha256
 
-rm -rf /home/luozhou/clearmeeting-v0.19.0
-mkdir -p /home/luozhou/clearmeeting-v0.19.0
-unzip -q clearmeeting-server-v0.19.0-semantic-timeline-r1.zip -d /home/luozhou/clearmeeting-v0.19.0
-cd /home/luozhou/clearmeeting-v0.19.0
+rm -rf /srv/clearmeeting/clearmeeting-v0.19.0
+mkdir -p /srv/clearmeeting/clearmeeting-v0.19.0
+unzip -q clearmeeting-server-v0.19.0-semantic-timeline-r1.zip -d /srv/clearmeeting/clearmeeting-v0.19.0
+cd /srv/clearmeeting/clearmeeting-v0.19.0
 sha256sum -c SHA256SUMS.txt
 ```
 
@@ -53,7 +53,7 @@ sudo apt install -y unzip rsync
 ## 三、备份现有数据
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 cp -a server/data/clearmeeting.db "backups/clearmeeting-before-v0.19.0-$(date +%Y%m%d-%H%M%S).db"
 ls -lh backups | tail
@@ -64,15 +64,15 @@ ls -lh backups | tail
 ## 四、覆盖程序但保留数据库和配置
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.19.0/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.0/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.0/apps/card-sim/ apps/card-sim/
-rsync -a --delete --exclude '.env' /home/luozhou/clearmeeting-v0.19.0/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.0/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.19.0/package.json .
-cp /home/luozhou/clearmeeting-v0.19.0/package-lock.json .
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.0/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.0/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.0/apps/card-sim/ apps/card-sim/
+rsync -a --delete --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.0/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.0/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.19.0/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.19.0/package-lock.json .
 
 test -f server/data/clearmeeting.db && echo '数据库仍在：OK'
 test -f deploy/.env && echo '.env 仍在：OK'
@@ -85,7 +85,7 @@ test -f deploy/.env && echo '.env 仍在：OK'
 只修改版本项，不触碰密码和 DeepSeek Key：
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 
 grep -q '^SERVER_RELEASE=' .env \
   && sed -i 's/^SERVER_RELEASE=.*/SERVER_RELEASE=clearmeeting-server-v0.19.0/' .env \
@@ -105,7 +105,7 @@ grep -E '^(SERVER_RELEASE|ROLLING_SUMMARY_MIN_SEGMENTS|DEVICE_ROLLING_SUMMARY_MA
 ## 六、重建并启动服务
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 
 docker compose --profile real-asr build --no-cache server nginx
 docker compose --profile real-asr up -d funasr speaker server nginx
@@ -150,23 +150,23 @@ EXPECTED_SERVER_VERSION=0.19.0 bash ./verify_api_v2.sh http://127.0.0.1
 先查看最新备份名：
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 ls -lt backups | head
 ```
 
 停止服务并恢复数据库（把文件名替换成实际备份名）：
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose stop server nginx
 
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 cp -a backups/clearmeeting-before-v0.19.0-YYYYMMDD-HHMMSS.db server/data/clearmeeting.db
 ```
 
 程序回滚时，重新解压并按第四节用上一版发布包覆盖，再执行：
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose --profile real-asr up -d funasr speaker server nginx
 ```

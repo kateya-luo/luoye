@@ -4,9 +4,9 @@ param(
     [string]$Profile = 'engineering',
     [switch]$FullClean,
     [switch]$Package,
-    [string]$ReleaseId = 'luoye-fw-v1.7.1-engineering-wav-dma-r1',
+    [string]$ReleaseId = 'luoye-fw-v2.0.0-engineering-stable-sdspi-r1',
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
+    [string]$ServerBaseUrl = 'https://meeting.example.invalid',
     [switch]$AllowInsecureHttp
 )
 
@@ -59,11 +59,11 @@ $buildResult
 
 if ($Package) {
     & (Join-Path $PSScriptRoot 'package_firmware.ps1') `
-        -BuildDir $(if ($Profile -eq 'engineering') { 'build-v171' } else { "build-$Profile" }) `
+        -BuildDir $(if ($Profile -eq 'engineering') { 'build-v200' } else { "build-$Profile" }) `
         -ReleaseId $ReleaseId `
-        -ExpectedVersion '1.7.1' `
-        -ServerRelease '0.21.0' `
-        -MinimumClientVersion '0.21.0' `
+        -ExpectedVersion '2.0.0' `
+        -ServerRelease '2.0.0' `
+        -MinimumClientVersion '2.0.0' `
         -Profile $Profile `
         -ServerBaseUrl $ServerBaseUrl `
         -AllowInsecureHttp:$AllowInsecureHttp

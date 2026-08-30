@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ReleaseId = 'clearmeeting-server-v0.21.0-upload-progress-r9',
+    [string]$ReleaseId = 'clearmeeting-server-v2.0.0-stable-r1',
     [string]$OutputDir = 'releases',
     [switch]$ReplaceExisting
 )
@@ -110,7 +110,8 @@ try {
         'docs/DEPLOYMENT-V0.19.3.md',
         'docs/DEPLOYMENT-V0.20.0.md',
         'docs/DEPLOYMENT-V0.20.1.md',
-        'docs/DEPLOYMENT-V0.21.0.md'
+        'docs/DEPLOYMENT-V0.21.0.md',
+        'docs/DEPLOYMENT-V2.0.0.md'
     )) {
         Copy-ReleaseTree $entry $stage
     }
@@ -127,7 +128,7 @@ try {
         release_id = $ReleaseId
         created_utc = [DateTime]::UtcNow.ToString('o')
         product = 'ClearMeeting'
-        server_version = '0.21.0'
+        server_version = '2.0.0'
         api_contract = 'luoye-device-api/2'
         device_auth_profile = 'engineering'
         minimum_firmware = '0.9.3'

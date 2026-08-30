@@ -77,7 +77,7 @@ export default function LoginScreen({onLogin}) {
               </div>
             ))}
             <div className="footnote">
-              <a href="#">{isDesktop ? 'Windows Client' : 'Web Client'} V0.21.0</a>
+              <a href="#">{isDesktop ? 'Windows Client' : 'Web Client'} V2.0.0</a>
               <div>© 2026 CLEAR MEETING. All rights reserved.</div>
             </div>
           </div>

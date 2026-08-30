@@ -7,22 +7,22 @@
 ## 1. Windows 上传
 
 ```powershell
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.20.0-offline-pipeline-r1.zip" "luozhou@192.168.31.183:/home/luozhou/"
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.20.0-offline-pipeline-r1.zip.sha256" "luozhou@192.168.31.183:/home/luozhou/"
-& "$env:WINDIR\System32\OpenSSH\ssh.exe" "luozhou@192.168.31.183"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.20.0-offline-pipeline-r1.zip" "deploy@192.0.2.10:/srv/clearmeeting/"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.20.0-offline-pipeline-r1.zip.sha256" "deploy@192.0.2.10:/srv/clearmeeting/"
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" "deploy@192.0.2.10"
 ```
 
 ## 2. Ubuntu 校验、解压和备份
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 sha256sum -c clearmeeting-server-v0.20.0-offline-pipeline-r1.zip.sha256
-mkdir -p /home/luozhou/clearmeeting-v0.20.0
-unzip -q clearmeeting-server-v0.20.0-offline-pipeline-r1.zip -d /home/luozhou/clearmeeting-v0.20.0
-cd /home/luozhou/clearmeeting-v0.20.0
+mkdir -p /srv/clearmeeting/clearmeeting-v0.20.0
+unzip -q clearmeeting-server-v0.20.0-offline-pipeline-r1.zip -d /srv/clearmeeting/clearmeeting-v0.20.0
+cd /srv/clearmeeting/clearmeeting-v0.20.0
 sha256sum -c SHA256SUMS.txt
 
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 stamp="$(date +%Y%m%d-%H%M%S)"
 cp -a server/data/clearmeeting.db "backups/clearmeeting-before-v0.20.0-${stamp}.db"
@@ -32,14 +32,14 @@ cp -a deploy/.env "backups/env-before-v0.20.0-${stamp}"
 ## 3. 覆盖代码，保留数据库和密钥
 
 ```bash
-cd /home/luozhou/clearmeeting
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.20.0/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.20.0/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.20.0/apps/card-sim/ apps/card-sim/
-rsync -a --delete --exclude '.env' /home/luozhou/clearmeeting-v0.20.0/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.20.0/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.20.0/package.json .
-cp /home/luozhou/clearmeeting-v0.20.0/package-lock.json .
+cd /srv/clearmeeting/clearmeeting
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.20.0/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.20.0/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.20.0/apps/card-sim/ apps/card-sim/
+rsync -a --delete --exclude '.env' /srv/clearmeeting/clearmeeting-v0.20.0/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.20.0/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.20.0/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.20.0/package-lock.json .
 test -f server/data/clearmeeting.db && echo '数据库保留：OK'
 test -f deploy/.env && echo '.env 保留：OK'
 ```
@@ -49,7 +49,7 @@ test -f deploy/.env && echo '.env 保留：OK'
 当前主机为 8 核、16 GiB、无显卡生产方案，推荐用独立 CPU 离线 FunASR，避免两小时录音抢占实时字幕服务。
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 set_env() { key="$1"; value="$2"; grep -q "^${key}=" .env && sed -i "s|^${key}=.*|${key}=${value}|" .env || printf '%s=%s\n' "$key" "$value" >> .env; }
 set_env SERVER_RELEASE clearmeeting-server-v0.20.0
 set_env DEVICE_OFFLINE_ASR_WINDOW_MS 300000
@@ -67,7 +67,7 @@ set_env OFFLINE_ASR_MODE 2pass
 awk '/MemTotal/ {print "Linux 可见内存：", $2/1024/1024, "GiB"; if ($2 < 15000000) exit 1}' /proc/meminfo \
   || { echo 'Linux 未识别完整 16 GiB，停止部署'; exit 1; }
 
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose --profile real-asr --profile offline-asr-cpu config >/dev/null
 docker compose --profile real-asr --profile offline-asr-cpu build server nginx
 docker compose --profile real-asr --profile offline-asr-cpu pull funasr-offline-cpu
@@ -114,7 +114,7 @@ PY
 若需要回滚，先停止新增的离线实例，再按 v0.19.3 包覆盖代码；新表对旧版无影响，通常不必回滚数据库。
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose --profile offline-asr-cpu stop funasr-offline-cpu
 sed -i '/^FUNASR_OFFLINE_WS_URL=/d;/^OFFLINE_ASR_MODE=/d;/^OFFLINE_ASR_WORKERS=/d;/^OFFLINE_ASR_LEASE_SECONDS=/d' .env
 # 然后按 DEPLOYMENT-V0.19.3.md 第 3–6 步覆盖并启动 v0.19.3。

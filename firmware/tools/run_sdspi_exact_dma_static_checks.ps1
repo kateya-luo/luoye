@@ -6,12 +6,14 @@ $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $sdspiPath = Join-Path $project 'components\esp_driver_sdspi\src\sdspi_host.c'
 $sdspiTransactionPath = Join-Path $project 'components\esp_driver_sdspi\src\sdspi_transaction.c'
 $spiPath = Join-Path $project 'components\esp_driver_spi\src\gpspi\spi_master.c'
+$sdmmcPath = Join-Path $project 'components\sdmmc\sdmmc_cmd.c'
 $storagePath = Join-Path $project 'components\storage_sd\storage_sd.c'
 $uploaderPath = Join-Path $project 'components\net_uploader\net_uploader.c'
 
 $sdspi = Get-Content -LiteralPath $sdspiPath -Raw -Encoding UTF8
 $sdspiTransaction = Get-Content -LiteralPath $sdspiTransactionPath -Raw -Encoding UTF8
 $spi = Get-Content -LiteralPath $spiPath -Raw -Encoding UTF8
+$sdmmc = Get-Content -LiteralPath $sdmmcPath -Raw -Encoding UTF8
 $storage = Get-Content -LiteralPath $storagePath -Raw -Encoding UTF8
 $uploader = Get-Content -LiteralPath $uploaderPath -Raw -Encoding UTF8
 
@@ -72,6 +74,18 @@ foreach ($required in @('LUOYE_SPI_EXACT_LENGTH_DMA_BACKPORT',
     if (-not $spi.Contains($required)) {
         throw "Missing SPI-master DMA backport invariant: $required"
     }
+}
+
+foreach ($required in @('LUOYE_SDSPI_HOST_OWNS_DMA_STAGING',
+                         'sdmmc_buffer_can_transfer_directly',
+                         'if (host_is_spi(card))',
+                         'if (can_transfer_directly)')) {
+    if (-not $sdmmc.Contains($required)) {
+        throw "Missing SPI-aware sdmmc DMA invariant: $required"
+    }
+}
+if ([regex]::Matches($sdmmc, 'if \(can_transfer_directly\)').Count -ne 2) {
+    throw 'Both sdmmc read and write paths must use the SPI-aware direct-transfer gate.'
 }
 
 for ($extraData = 0; $extraData -le 7; $extraData++) {

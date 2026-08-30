@@ -47,11 +47,18 @@ $privateKeyPattern = 'BEGIN ' + '(RSA |EC |OPENSSH )?PRIVATE KEY'
 $githubTokenPattern = 'gh' + '[pousr]_[A-Za-z0-9]{20,}'
 $awsAccessPattern = 'AK' + 'IA[0-9A-Z]{16}'
 $providerKeyPattern = 'sk-' + '[A-Za-z0-9_-]{24,}'
+$privateCloudDomainPattern = 'clearmeeting' + '\.chat'
+$privateCloudIpPattern = '192\.168\.31\.' + '183'
+$privateWifiPattern = 'TP-LINK_' + '184F'
 $secretPatterns = @(
     @{ Name = 'private-key'; Pattern = $privateKeyPattern },
     @{ Name = 'github-token'; Pattern = $githubTokenPattern },
     @{ Name = 'aws-access-key'; Pattern = $awsAccessPattern },
-    @{ Name = 'provider-api-key'; Pattern = $providerKeyPattern }
+    @{ Name = 'provider-api-key'; Pattern = $providerKeyPattern },
+    @{ Name = 'configured-deepseek-key'; Pattern = '(?m)^\s*DEEPSEEK_API_KEY\s*=\s*[^\s#].*$' },
+    @{ Name = 'private-cloud-domain'; Pattern = $privateCloudDomainPattern },
+    @{ Name = 'private-cloud-ip'; Pattern = $privateCloudIpPattern },
+    @{ Name = 'private-wifi-ssid'; Pattern = $privateWifiPattern }
 )
 
 $totalBytes = [int64]0

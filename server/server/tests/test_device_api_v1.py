@@ -91,7 +91,7 @@ class DeviceV1Test(unittest.TestCase):
 
     def test_build_info_contract(self):
         body = self.client.get("/api/v2/build-info").json()
-        self.assertEqual(body["server_version"], "0.21.0")
+        self.assertEqual(body["server_version"], "2.0.0")
         self.assertEqual(body["protocol_version"], "luoye-device-api/2")
         self.assertEqual(body["device_auth_profile"], "engineering")
         self.assertIn("idempotent_upload", body["capabilities"])

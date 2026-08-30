@@ -4,7 +4,7 @@ param(
     [string]$Profile = 'engineering',
     [switch]$FullClean,
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
+    [string]$ServerBaseUrl = 'https://meeting.example.invalid',
     [switch]$AllowInsecureHttp
 )
 
@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $idfPy)) {
 }
 $idfVersion = (& python $idfPy --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $idfVersion -notmatch 'v5\.5\.4') {
-    throw "Luoye v1.7.1 requires ESP-IDF v5.5.4; detected: $idfVersion"
+    throw "Luoye v2.0.0 requires ESP-IDF v5.5.4; detected: $idfVersion"
 }
 
 if ($ServerBaseUrl.StartsWith('http://')) {
@@ -35,7 +35,7 @@ if ($ServerBaseUrl.StartsWith('http://')) {
 $allowHttpValue = if ($AllowInsecureHttp) { 'ON' } else { 'OFF' }
 
 if ($Profile -eq 'engineering') {
-    $buildDir = Join-Path $project 'build-v171'
+    $buildDir = Join-Path $project 'build-v200'
     $sdkconfigPath = Join-Path $project 'sdkconfig.ui154'
     $defaults = 'sdkconfig.defaults'
 } else {
@@ -71,7 +71,7 @@ try {
 
     $description = Get-Content -LiteralPath (Join-Path $buildDir 'project_description.json') -Raw |
         ConvertFrom-Json
-    if ($description.project_version -ne '1.7.1') {
+    if ($description.project_version -ne '2.0.0') {
         throw "Embedded version mismatch: $($description.project_version)"
     }
     if ($description.target -ne 'esp32s3') {
@@ -92,6 +92,14 @@ try {
     })
     if ($actualSpi.Count -ne 1) {
         throw 'Project-local esp_driver_spi override is not active.'
+    }
+    $expectedSdmmc = [IO.Path]::GetFullPath(
+        (Join-Path $project 'components\sdmmc'))
+    $actualSdmmc = @($description.build_component_paths | Where-Object {
+        $_ -and [IO.Path]::GetFullPath([string]$_) -eq $expectedSdmmc
+    })
+    if ($actualSdmmc.Count -ne 1) {
+        throw 'Project-local sdmmc override is not active.'
     }
 
     [pscustomobject]@{

@@ -46,11 +46,11 @@ SSD1681 首帧用 `0xF7` 建立黑白基准；后续页面使用随屏幕模组�
 ## 构建与烧录
 
 当前验证构建目录为 `build-v170`，服务器地址为
-`http://clearmeeting.chat:34567`。在 ESP-IDF 5.5 CMD 中执行：
+`http://meeting.example.invalid:34567`。在 ESP-IDF 5.5 CMD 中执行：
 
 ```bat
 cd /d D:\LUOYE_PROJECT_HANDOFF_2026-08-19\01_FIRMWARE\maintenance\recorder-card-v1.7.0
-powershell -ExecutionPolicy Bypass -File tools\build_profile.ps1 -Profile engineering -ServerBaseUrl http://clearmeeting.chat:34567 -AllowInsecureHttp
+powershell -ExecutionPolicy Bypass -File tools\build_profile.ps1 -Profile engineering -ServerBaseUrl http://meeting.example.invalid:34567 -AllowInsecureHttp
 idf.py -B build-v170 -p COM22 flash monitor
 ```
 

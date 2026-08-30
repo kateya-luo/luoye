@@ -5,7 +5,7 @@
 从 v0.20.0 升级时重复执行 `DEPLOYMENT-V0.20.0.md` 的上传、校验、备份和覆盖步骤，将包名及目录版本改为 `v0.20.1`，然后写入：
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 set_env() { key="$1"; value="$2"; grep -q "^${key}=" .env && sed -i "s|^${key}=.*|${key}=${value}|" .env || printf '%s=%s\n' "$key" "$value" >> .env; }
 set_env SERVER_RELEASE clearmeeting-server-v0.20.1
 set_env OFFLINE_ASR_MAX_RETRIES 30

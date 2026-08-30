@@ -1,66 +1,81 @@
-# ClearMeeting Server 0.21.0 R9
+# ClearMeeting Server 2.0.0
 
-ClearMeeting 是落叶 ESP32-S3 录音卡配套的自托管服务端与 Web 应用。当前版本与固件 1.7.1 R1 共同使用 `luoye-device-api/2`。
+ClearMeeting 是落叶 ESP32-S3 录音卡的自托管云服务。当前 `2.0.0 stable R1` 直接由已经验证的 `v0.21.0-upload-progress-r9` 重新编号，保持 `luoye-device-api/2`、10 MiB 范围补传和真实上传进度语义不变。
 
-## 工作流程
+## 主要功能
 
-1. 用户登录 ClearMeeting，并用一次性配对码绑定录音卡。
-2. 设备先把 WAV 安全写入 microSD，同时上传可用的实时音频。
-3. 断网或退出后，设备依据服务器缺口继续补传；服务器只确认完整、校验通过的范围。
-4. 音频完整后，服务器执行整场离线转写和最终多人识别。
-5. 用户在历史页选择模板生成会议纪要，并可编辑说话人、待办和导出内容。
+- 账号、会议、设备、议程与待办按用户隔离。
+- 一次性设备配对、可撤销设备令牌和绑定代次校验。
+- 在线录音实时转写与翻译，离线录音幂等分片补传。
+- 完整音频到达后执行整场规范转写、说话人识别和会议纪要。
+- 按持久化音频范围的并集显示真实上传覆盖率和缺失时长。
+- 网页提供会议历史、人员校正、议程待办、设备/SD 管理及 Word、Markdown、TXT 导出。
 
-## 0.21.0 R9 重点
+## 版本边界
 
-- 补传进度直接显示服务器已经持久化确认的音频覆盖率。
-- 按字节区间并集计算覆盖，稀疏文件和重复上传不会虚增百分比。
-- 显示缺失音频时长、后台任务、排队数量和预计处理时间。
-- 网页在线会议与录音卡会议统一经过整场 canonical ASR 和最终多人识别。
-- 会议结束后由用户选择模板调用 DeepSeek 生成正式纪要。
-- 保持 10 MiB 设备上传范围、幂等会话、缺口修复和账号隔离。
+| 项目 | 当前值 |
+| --- | --- |
+| 服务器 | `2.0.0` / `clearmeeting-server-v2.0.0` |
+| 来源基线 | `v0.21.0-upload-progress-r9` |
+| 设备协议 | `luoye-device-api/2` |
+| 推荐固件 | `Luoye 2.0.0 stable-sdspi R1`（源自固件 1.7.2） |
+| 设备鉴权 | `engineering` |
 
-## 技术栈
-
-FastAPI · React 19 · Vite · SQLite · Docker Compose · nginx · FunASR · CAM++ · DeepSeek
-
-## API 边界
-
-| 区域 | 路径 | 身份 |
-| --- | --- | --- |
-| 网页登录与账号数据 | `/api/v1/*` | 账号凭据或账号令牌 |
-| 录音卡配对、会话、上传、字幕和议程 | `/api/v2/*` | 配对 nonce 或设备令牌 |
-| 版本兼容检查 | `/api/v2/build-info` | 无 |
-| 服务健康检查 | `/health`、`/health/ready` | 无 |
+设备可通过 `GET /api/v2/build-info` 检查版本、协议和能力列表。API/2 工程鉴权并不等同于量产设备证书体系。
 
 ## 快速部署
 
 ```bash
 cd deploy
 cp .env.example .env
-# 编辑 .env，设置独立密钥、密码、模型地址与允许的 CORS 来源
-docker compose --profile real-asr --profile offline-asr-cpu up -d --build
+# 编辑 .env，填写独立强密钥、自己的 HTTPS Origin 和可选 AI Key
+docker compose --profile real-asr up -d --build
 bash check.sh
-EXPECTED_SERVER_VERSION=0.21.0 bash ./verify_api_v2.sh http://127.0.0.1
+bash verify_api_v2.sh
 ```
 
-升级、备份、验证和回退步骤见 [V0.21.0 部署说明](docs/DEPLOYMENT-V0.21.0.md)。
+部署前至少设置：
 
-## 本地验证
+- `TEST_ACCOUNT_PASSWORD`
+- `AUTH_SECRET`
+- `DEVICE_API_SECRET`
+- `CORS_ALLOW_ORIGINS`
+- `DEEPSEEK_API_KEY`（需要翻译或 AI 纪要时）
 
-```bash
-python -m pip install -r server/requirements.txt
+完整升级流程见 [V2.0.0 部署说明](docs/DEPLOYMENT-V2.0.0.md)。
+
+## 隐私与密钥
+
+- 仓库只提供 `.env.example`，真实 `.env`、数据库、录音、密码、token 和 API Key 不进入 Git。
+- `DEEPSEEK_API_KEY` 从运行环境读取，示例值为空；代码中没有内置密钥。
+- 示例地址使用 `meeting.example.invalid` 或 RFC 5737 文档地址，部署时替换为自己的 HTTPS 域名。
+- 不要把真实 `.env` 打进发布 ZIP；`deploy/package_server.ps1` 只打包示例配置。
+
+## 开发验证
+
+后端：
+
+```powershell
 cd server
-python -m unittest discover -s tests -p 'test_*.py'
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-```bash
-npm ci
-npm run build:web
+前端：
+
+```powershell
+cd apps/web-client
+pnpm install --frozen-lockfile
+pnpm test
+pnpm build
 ```
 
-## 安全提示
+## 目录
 
-- 不要提交 `deploy/.env`、`server/.env`、`server/data/`、SQLite 数据库、录音或模型密钥。
-- 发布包中的 `.env.example` 只允许包含占位值。
-- 工程 HTTP 入口只用于隔离网络联调；真实数据必须部署 HTTPS。
-- 数据库升级前先使用 SQLite backup API 生成一致性备份。
+```text
+server/             FastAPI、SQLite、设备 API 与后台任务
+apps/web-client/    React 19 / Vite 网页
+deploy/             Docker Compose、nginx、环境模板和验证脚本
+docs/               API、部署、升级和架构说明
+```
+
+技术栈：FastAPI · React 19 · Vite · SQLite · Docker Compose · nginx · FunASR · CAM++ · DeepSeek

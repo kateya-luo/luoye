@@ -9,27 +9,27 @@
 ```powershell
 cd "D:\创业项目\录音卡\fuwuqi"
 
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip" "luozhou@192.168.31.183:/home/luozhou/"
-& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip.sha256" "luozhou@192.168.31.183:/home/luozhou/"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip" "deploy@192.0.2.10:/srv/clearmeeting/"
+& "$env:WINDIR\System32\OpenSSH\scp.exe" ".\clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip.sha256" "deploy@192.0.2.10:/srv/clearmeeting/"
 
-& "$env:WINDIR\System32\OpenSSH\ssh.exe" "luozhou@192.168.31.183"
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" "deploy@192.0.2.10"
 ```
 
 注意：前三条是 Windows 命令，不要粘贴到 Ubuntu 终端。
 
 ## 2. Ubuntu 校验并解压
 
-看到 `luozhou@...:~$` 后逐行执行：
+看到 `deploy@...:~$` 后逐行执行：
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 ls -lh clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip*
 sha256sum -c clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip.sha256
 
-rm -rf /home/luozhou/clearmeeting-v0.19.1
-mkdir -p /home/luozhou/clearmeeting-v0.19.1
-unzip -q clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip -d /home/luozhou/clearmeeting-v0.19.1
-cd /home/luozhou/clearmeeting-v0.19.1
+rm -rf /srv/clearmeeting/clearmeeting-v0.19.1
+mkdir -p /srv/clearmeeting/clearmeeting-v0.19.1
+unzip -q clearmeeting-server-v0.19.1-ui-timeline-hotfix-r1.zip -d /srv/clearmeeting/clearmeeting-v0.19.1
+cd /srv/clearmeeting/clearmeeting-v0.19.1
 sha256sum -c SHA256SUMS.txt
 ```
 
@@ -38,7 +38,7 @@ sha256sum -c SHA256SUMS.txt
 ## 3. 备份数据库
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 cp -a server/data/clearmeeting.db "backups/clearmeeting-before-v0.19.1-$(date +%Y%m%d-%H%M%S).db"
 ls -lh backups | tail
@@ -47,15 +47,15 @@ ls -lh backups | tail
 ## 4. 覆盖程序，保留数据与配置
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.19.1/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.1/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.1/apps/card-sim/ apps/card-sim/
-rsync -a --delete --exclude '.env' /home/luozhou/clearmeeting-v0.19.1/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.19.1/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.19.1/package.json .
-cp /home/luozhou/clearmeeting-v0.19.1/package-lock.json .
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.1/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.1/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.1/apps/card-sim/ apps/card-sim/
+rsync -a --delete --exclude '.env' /srv/clearmeeting/clearmeeting-v0.19.1/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.19.1/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.19.1/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.19.1/package-lock.json .
 
 test -f server/data/clearmeeting.db && echo '数据库仍在：OK'
 test -f deploy/.env && echo '.env 仍在：OK'
@@ -64,7 +64,7 @@ test -f deploy/.env && echo '.env 仍在：OK'
 ## 5. 更新版本标识并重建
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 
 grep -q '^SERVER_RELEASE=' .env \
   && sed -i 's/^SERVER_RELEASE=.*/SERVER_RELEASE=clearmeeting-server-v0.19.1/' .env \
@@ -78,7 +78,7 @@ docker compose ps
 ## 6. 验证
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 curl -fsS http://127.0.0.1/api/v2/build-info
 echo
 curl -fsS http://127.0.0.1/health/ready

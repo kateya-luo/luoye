@@ -38,4 +38,4 @@ mkdir -p \
 docker compose --profile real-asr up -d --build
 docker compose ps
 bash "${SCRIPT_DIR}/check.sh"
-echo "启动完成：局域网请访问 http://192.168.31.183/"
+echo "启动完成：局域网请访问 http://192.0.2.10/"

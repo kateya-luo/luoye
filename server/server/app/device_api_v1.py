@@ -40,7 +40,7 @@ from .translator import dominant_lang
 logger = logging.getLogger("ai_recorder.device_v2")
 
 API_CONTRACT = "luoye-device-api/2"
-SERVER_RELEASE = os.getenv("SERVER_RELEASE", "clearmeeting-server-v0.21.0")
+SERVER_RELEASE = os.getenv("SERVER_RELEASE", "clearmeeting-server-v2.0.0")
 DEVICE_AUTH_PROFILE = os.getenv("DEVICE_AUTH_PROFILE", "engineering").strip().lower()
 if DEVICE_AUTH_PROFILE != "engineering":
     raise RuntimeError(
@@ -2675,7 +2675,7 @@ def create_device_v2_router(storage: Any, *,
     async def build_info():
         return {
             "product": "ClearMeeting",
-            "server_version": "0.21.0",
+            "server_version": "2.0.0",
             "server_release": SERVER_RELEASE,
             "api_contract": API_CONTRACT,
             "protocol_version": API_CONTRACT,

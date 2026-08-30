@@ -3,7 +3,7 @@ set -euo pipefail
 
 base_url="${1:-${CLEARMEETING_BASE_URL:-http://127.0.0.1}}"
 base_url="${base_url%/}"
-expected_version="${EXPECTED_SERVER_VERSION:-0.21.0}"
+expected_version="${EXPECTED_SERVER_VERSION:-2.0.0}"
 expected_contract="${EXPECTED_API_CONTRACT:-luoye-device-api/2}"
 
 command -v curl >/dev/null 2>&1 || { echo "失败：需要 curl" >&2; exit 1; }

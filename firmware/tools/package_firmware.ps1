@@ -1,16 +1,16 @@
 [CmdletBinding()]
 param(
-    [string]$BuildDir = 'build-v171',
-    [string]$ReleaseId = 'luoye-fw-v1.7.1-engineering-wav-dma-r1',
-    [string]$ExpectedVersion = '1.7.1',
+    [string]$BuildDir = 'build-v200',
+    [string]$ReleaseId = 'luoye-fw-v2.0.0-engineering-stable-sdspi-r1',
+    [string]$ExpectedVersion = '2.0.0',
     [ValidateSet('dev', 'rc', 'release', 'engineering')]
     [string]$Profile = 'engineering',
     [string]$HardwareRev = 'LY-HW-ENG-20260710',
     [string]$ApiContract = 'luoye-device-api/2',
-    [string]$ServerRelease = '0.21.0',
-    [string]$MinimumClientVersion = '0.21.0',
+    [string]$ServerRelease = '2.0.0',
+    [string]$MinimumClientVersion = '2.0.0',
     [ValidatePattern('^https?://[A-Za-z0-9.-]+(:[0-9]+)?$')]
-    [string]$ServerBaseUrl = 'https://clearmeeting.chat',
+    [string]$ServerBaseUrl = 'https://meeting.example.invalid',
     [switch]$AllowInsecureHttp,
     [string]$OutputDir = 'releases',
     [switch]$AllowDirty
@@ -81,13 +81,15 @@ function Test-Checksums([string]$Root) {
 if (-not (Test-Path -LiteralPath $build -PathType Container)) {
     throw "Build directory not found: $build"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $project '.git'))) {
+$repoRoot = (& git -C $project rev-parse --show-toplevel 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
     throw 'Release packaging requires a Git repository.'
 }
+$repoRoot = [IO.Path]::GetFullPath($repoRoot)
 
-$commit = (& git -C $project rev-parse HEAD).Trim()
+$commit = (& git -C $repoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source commit.' }
-$dirtyRows = @(& git -C $project status --porcelain)
+$dirtyRows = @(& git -C $repoRoot status --porcelain)
 $dirty = $dirtyRows.Count -gt 0
 if ($dirty -and -not $AllowDirty) {
     throw 'Working tree is dirty. Commit the exact source before packaging.'
@@ -159,7 +161,8 @@ if ($compiledAllowHttp -ne 0 -and $Profile -ne 'dev' -and $Profile -ne 'engineer
 # strings. Both patched drivers must resolve to this committed project tree.
 $expectedLocalComponents = @(
     [IO.Path]::GetFullPath((Join-Path $project 'components\esp_driver_spi')),
-    [IO.Path]::GetFullPath((Join-Path $project 'components\esp_driver_sdspi'))
+    [IO.Path]::GetFullPath((Join-Path $project 'components\esp_driver_sdspi')),
+    [IO.Path]::GetFullPath((Join-Path $project 'components\sdmmc'))
 )
 $actualComponentPaths = @($description.build_component_paths |
     Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
@@ -179,6 +182,7 @@ $criticalSources = [ordered]@{
     esp_driver_spi_master = (Join-Path $project 'components\esp_driver_spi\src\gpspi\spi_master.c')
     esp_driver_sdspi_host = (Join-Path $project 'components\esp_driver_sdspi\src\sdspi_host.c')
     esp_driver_sdspi_transaction = (Join-Path $project 'components\esp_driver_sdspi\src\sdspi_transaction.c')
+    sdmmc_command = (Join-Path $project 'components\sdmmc\sdmmc_cmd.c')
     storage_runtime = (Join-Path $project 'components\storage_sd\storage_sd.c')
     upload_store = (Join-Path $project 'components\storage_sd\upload_store.c')
 }
@@ -413,7 +417,7 @@ pause
         "idf_git_commit=$idfCommit",
         "idf_git_describe=$idfDescribe",
         "idf_git_dirty=$idfDirty",
-        "branch=$((& git -C $project branch --show-current).Trim())"
+        "branch=$((& git -C $repoRoot branch --show-current).Trim())"
     )
     Write-Checksums $symbolsStage
     Test-Checksums $symbolsStage

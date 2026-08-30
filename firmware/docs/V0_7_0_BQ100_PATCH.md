@@ -24,9 +24,9 @@ Charge policy:
 
 Network route policy:
 
-- `TP-LINK_184F` uses `http://192.168.31.183`.
+- `YOUR_LAN_SSID` uses `http://192.0.2.10`.
 - Every other WiFi uses the compiled public endpoint
-  `http://clearmeeting.chat:34567`.
+  `http://meeting.example.invalid:34567`.
 
 Time display:
 

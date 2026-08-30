@@ -5,26 +5,26 @@
 ## 部署
 
 压缩包解压后是完整的项目根目录。生产环境使用稳定路径
-`/home/luozhou/clearmeeting`，所以应将新版代码同步进该目录，同时排除
+`/srv/clearmeeting/clearmeeting`，所以应将新版代码同步进该目录，同时排除
 `server/data` 和 `deploy/.env`。
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 unzip -q clearmeeting-server-v0.21.0-upload-progress-r9.zip -d clearmeeting-v0.21.0-release
 
 # 1. 稳定备份 SQLite（包含 WAL 中尚未 checkpoint 的数据）
-mkdir -p /home/luozhou/clearmeeting-backups/v0.21.0-predeploy
-cd /home/luozhou/clearmeeting/deploy
+mkdir -p /srv/clearmeeting/clearmeeting-backups/v0.21.0-predeploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose exec -T server python -c "import sqlite3; s=sqlite3.connect('/app/data/clearmeeting.db'); d=sqlite3.connect('/app/data/clearmeeting.db.pre-v0.21.0'); s.backup(d); d.close(); s.close()"
-cp -p .env /home/luozhou/clearmeeting-backups/v0.21.0-predeploy/deploy.env
+cp -p .env /srv/clearmeeting/clearmeeting-backups/v0.21.0-predeploy/deploy.env
 
 # 2. 更新代码，不覆盖会议数据和密钥
 rsync -a --delete \
   --exclude 'server/data/' \
   --exclude 'deploy/.env' \
-  /home/luozhou/clearmeeting-v0.21.0-release/ /home/luozhou/clearmeeting/
+  /srv/clearmeeting/clearmeeting-v0.21.0-release/ /srv/clearmeeting/clearmeeting/
 
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 sed -i 's/^SERVER_RELEASE=.*/SERVER_RELEASE=clearmeeting-server-v0.21.0/' .env
 grep -q '^DEEPSEEK_MINUTES_MODEL=' .env || echo 'DEEPSEEK_MINUTES_MODEL=deepseek-v4-flash' >> .env
 
@@ -85,6 +85,6 @@ GET /api/v1/meetings/{session_id}/processing
 
 ## 回退
 
-将部署前代码备份同步回 `/home/luozhou/clearmeeting`，保留 `server/data`
+将部署前代码备份同步回 `/srv/clearmeeting/clearmeeting`，保留 `server/data`
 与 `.env`，然后重建 `server nginx`。V0.20.3 会忽略本版新增的表和字段；
 若需完整数据库回退，必须先停服务，再恢复 `clearmeeting.db.pre-v0.21.0`。

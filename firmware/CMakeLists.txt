@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 # Luoye firmware release identity. PROJECT_VER is the only firmware-version
 # source; the UI and startup log read the ESP app descriptor generated from it.
-set(PROJECT_VER "1.7.1")
+set(PROJECT_VER "2.0.0")
 set(LUOYE_PRODUCT_NAME "Luoye" CACHE STRING "Internal product name")
 set(LUOYE_PRODUCT_NAME_ZH "落叶" CACHE STRING "Internal product name (Chinese)")
 set(LUOYE_HARDWARE_REV "LY-HW-ENG-20260710" CACHE STRING "Target PCB revision")
@@ -13,16 +13,32 @@ set(LUOYE_DEVICE_AUTH_PROFILE "engineering" CACHE STRING
 # Protocol compatibility is release identity, not a reusable build-cache knob.
 # Keep these normal variables so an older build directory cannot silently
 # stamp stale server/client versions into a new firmware package.
-set(LUOYE_SERVER_RELEASE "0.21.0")
-set(LUOYE_MIN_CLIENT_VERSION "0.21.0")
-set(LUOYE_SERVER_BASE_URL "http://clearmeeting.chat:34567" CACHE STRING
+set(LUOYE_SERVER_RELEASE "2.0.0")
+set(LUOYE_MIN_CLIENT_VERSION "2.0.0")
+set(LUOYE_SERVER_BASE_URL "https://meeting.example.invalid" CACHE STRING
     "ClearMeeting API origin without a trailing slash")
+set(LUOYE_LAN_WIFI_SSID "" CACHE STRING
+    "Optional Wi-Fi SSID that selects a private ClearMeeting endpoint")
+set(LUOYE_LAN_SERVER_BASE_URL "" CACHE STRING
+    "Optional private ClearMeeting origin used only on LUOYE_LAN_WIFI_SSID")
 option(LUOYE_ALLOW_INSECURE_HTTP
        "Allow plaintext HTTP for dev-profile LAN integration only" OFF)
 
 if(NOT LUOYE_DEVICE_AUTH_PROFILE STREQUAL "engineering")
   message(FATAL_ERROR
-    "Luoye 1.7.1 is frozen to device_auth_profile=engineering")
+    "Luoye 2.0.0 is frozen to device_auth_profile=engineering")
+endif()
+if((LUOYE_LAN_WIFI_SSID STREQUAL "" AND
+    NOT LUOYE_LAN_SERVER_BASE_URL STREQUAL "") OR
+   (NOT LUOYE_LAN_WIFI_SSID STREQUAL "" AND
+    LUOYE_LAN_SERVER_BASE_URL STREQUAL ""))
+  message(FATAL_ERROR
+    "LUOYE_LAN_WIFI_SSID and LUOYE_LAN_SERVER_BASE_URL must be set together")
+endif()
+if(NOT LUOYE_LAN_SERVER_BASE_URL STREQUAL "" AND
+   NOT LUOYE_LAN_SERVER_BASE_URL MATCHES "^https?://[A-Za-z0-9.-]+(:[0-9]+)?$")
+  message(FATAL_ERROR
+    "LUOYE_LAN_SERVER_BASE_URL must be an http(s) origin without a path")
 endif()
 
 if(NOT LUOYE_SERVER_BASE_URL MATCHES "^https?://[A-Za-z0-9.-]+(:[0-9]+)?$")

@@ -8,44 +8,44 @@
 
 ```powershell
 cd D:\OPENOP\files-mentioned-by-the-user-chatgpt\clearmeeting\releases
-scp .\clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip luozhou@192.168.31.183:/home/luozhou/
-scp .\clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip.sha256 luozhou@192.168.31.183:/home/luozhou/
-ssh luozhou@192.168.31.183
+scp .\clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip deploy@192.0.2.10:/srv/clearmeeting/
+scp .\clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip.sha256 deploy@192.0.2.10:/srv/clearmeeting/
+ssh deploy@192.0.2.10
 ```
 
 登录服务器后执行：
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 sed -i 's/\r$//' clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip.sha256
 sha256sum -c clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip.sha256
-rm -rf /home/luozhou/clearmeeting-v0.18.0
-mkdir -p /home/luozhou/clearmeeting-v0.18.0
-unzip -q clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip -d /home/luozhou/clearmeeting-v0.18.0
-cd /home/luozhou/clearmeeting-v0.18.0
+rm -rf /srv/clearmeeting/clearmeeting-v0.18.0
+mkdir -p /srv/clearmeeting/clearmeeting-v0.18.0
+unzip -q clearmeeting-server-v0.18.0-device-timeline-speaker-r1.zip -d /srv/clearmeeting/clearmeeting-v0.18.0
+cd /srv/clearmeeting/clearmeeting-v0.18.0
 sha256sum -c SHA256SUMS.txt
 ```
 
 ## 2. 备份数据库并覆盖程序
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 cp -a server/data/clearmeeting.db "backups/clearmeeting-$(date +%Y%m%d-%H%M%S).db"
 
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.18.0/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.18.0/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.18.0/apps/card-sim/ apps/card-sim/
-rsync -a --delete --exclude '.env' /home/luozhou/clearmeeting-v0.18.0/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.18.0/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.18.0/package.json .
-cp /home/luozhou/clearmeeting-v0.18.0/package-lock.json .
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.18.0/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.18.0/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.18.0/apps/card-sim/ apps/card-sim/
+rsync -a --delete --exclude '.env' /srv/clearmeeting/clearmeeting-v0.18.0/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.18.0/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.18.0/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.18.0/package-lock.json .
 ```
 
 ## 3. 确认多人语音配置
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 grep -q '^SPEAKER_MODE=' .env && sed -i 's/^SPEAKER_MODE=.*/SPEAKER_MODE=remote/' .env || echo 'SPEAKER_MODE=remote' >> .env
 grep -q '^SPEAKER_EMBEDDING_URL=' .env && sed -i 's|^SPEAKER_EMBEDDING_URL=.*|SPEAKER_EMBEDDING_URL=http://speaker:10100/embed|' .env || echo 'SPEAKER_EMBEDDING_URL=http://speaker:10100/embed' >> .env
 grep -q '^SERVER_RELEASE=' .env && sed -i 's/^SERVER_RELEASE=.*/SERVER_RELEASE=clearmeeting-server-v0.18.0/' .env || echo 'SERVER_RELEASE=clearmeeting-server-v0.18.0' >> .env
@@ -56,7 +56,7 @@ grep -q '^SERVER_RELEASE=' .env && sed -i 's/^SERVER_RELEASE=.*/SERVER_RELEASE=c
 ## 4. 重建并启动全部依赖
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose --profile real-asr build --no-cache speaker server nginx
 docker compose --profile real-asr up -d funasr speaker server nginx
 docker compose ps

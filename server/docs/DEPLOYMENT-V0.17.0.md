@@ -4,41 +4,41 @@
 
 ## 部署前准备
 
-- 服务器项目目录：`/home/luozhou/clearmeeting`
+- 服务器项目目录：`/srv/clearmeeting/clearmeeting`
 - 发布包：`clearmeeting-server-v0.17.0-timeline-r1.zip`
 - 保留现有 `.env` 和 `server/data`，不要删除数据库。
 
 ## 升级步骤
 
 ```bash
-cd /home/luozhou
+cd /srv/clearmeeting
 sha256sum -c clearmeeting-server-v0.17.0-timeline-r1.zip.sha256
-rm -rf /home/luozhou/clearmeeting-v0.17.0
-mkdir -p /home/luozhou/clearmeeting-v0.17.0
-unzip -q clearmeeting-server-v0.17.0-timeline-r1.zip -d /home/luozhou/clearmeeting-v0.17.0
-cd /home/luozhou/clearmeeting-v0.17.0
+rm -rf /srv/clearmeeting/clearmeeting-v0.17.0
+mkdir -p /srv/clearmeeting/clearmeeting-v0.17.0
+unzip -q clearmeeting-server-v0.17.0-timeline-r1.zip -d /srv/clearmeeting/clearmeeting-v0.17.0
+cd /srv/clearmeeting/clearmeeting-v0.17.0
 sha256sum -c SHA256SUMS.txt
 ```
 
 备份数据库并覆盖程序文件：
 
 ```bash
-cd /home/luozhou/clearmeeting
+cd /srv/clearmeeting/clearmeeting
 mkdir -p backups
 cp -a server/data/clearmeeting.db "backups/clearmeeting-$(date +%Y%m%d-%H%M%S).db"
-rsync -a --delete --exclude 'data/' --exclude '.env' /home/luozhou/clearmeeting-v0.17.0/server/ server/
-rsync -a --delete /home/luozhou/clearmeeting-v0.17.0/apps/web-client/ apps/web-client/
-rsync -a --delete /home/luozhou/clearmeeting-v0.17.0/apps/card-sim/ apps/card-sim/
-rsync -a --delete /home/luozhou/clearmeeting-v0.17.0/deploy/ deploy/
-rsync -a --delete /home/luozhou/clearmeeting-v0.17.0/docs/ docs/
-cp /home/luozhou/clearmeeting-v0.17.0/package.json .
-cp /home/luozhou/clearmeeting-v0.17.0/package-lock.json .
+rsync -a --delete --exclude 'data/' --exclude '.env' /srv/clearmeeting/clearmeeting-v0.17.0/server/ server/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.17.0/apps/web-client/ apps/web-client/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.17.0/apps/card-sim/ apps/card-sim/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.17.0/deploy/ deploy/
+rsync -a --delete /srv/clearmeeting/clearmeeting-v0.17.0/docs/ docs/
+cp /srv/clearmeeting/clearmeeting-v0.17.0/package.json .
+cp /srv/clearmeeting/clearmeeting-v0.17.0/package-lock.json .
 ```
 
 重新构建并启动：
 
 ```bash
-cd /home/luozhou/clearmeeting/deploy
+cd /srv/clearmeeting/clearmeeting/deploy
 docker compose build --no-cache api web
 docker compose up -d
 docker compose ps

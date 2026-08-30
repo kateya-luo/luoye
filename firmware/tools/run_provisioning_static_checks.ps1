@@ -18,10 +18,13 @@ if ($net -notmatch "s_pair\.ap_password\[0\] = '\\0'" -or
     throw 'Provisioning SoftAP must be open and expose the no-password display field.'
 }
 
-if ($cmake -notmatch 'LUOYE_SERVER_BASE_URL\s+"http://clearmeeting\.chat:34567"' -or
+if ($cmake -notmatch 'LUOYE_SERVER_BASE_URL\s+"https://meeting\.example\.invalid"' -or
+    $cmake -notmatch 'LUOYE_LAN_WIFI_SSID\s+""' -or
+    $cmake -notmatch 'LUOYE_LAN_SERVER_BASE_URL\s+""' -or
     $cmake -notmatch 'LUOYE_ALLOW_INSECURE_HTTP' -or
     $cmake -notmatch 'Plain HTTP is restricted to dev/engineering builds' -or
     $netConfig -notmatch 'LUOYE_CFG_SERVER_BASE_URL' -or
+    $netConfig -notmatch 'LUOYE_CFG_LAN_WIFI_SSID' -or
     $net -notmatch 'minimum_firmware' -or
     $net -notmatch 'firmware_at_least' -or
     $net -notmatch 'provisioning_pair_restart_required' -or
@@ -149,9 +152,9 @@ foreach ($pattern in @('\u8bf7\u63d2\u5165SD\u5361',
     }
 }
 
-if ($cmake -notmatch 'PROJECT_VER\s+"1\.7\.1"' -or
+if ($cmake -notmatch 'PROJECT_VER\s+"2\.0\.0"' -or
     $cmake -notmatch 'luoye-device-api/2') {
-    throw 'Firmware version or API contract does not match v1.7.1.'
+    throw 'Firmware version or API contract does not match v2.0.0.'
 }
 
 Write-Output 'provisioning static checks passed'

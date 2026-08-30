@@ -89,9 +89,10 @@ foreach ($removed in @('power_soc_calibrate_x256',
         throw "Legacy SOC-coupled behavior is still present: $removed"
     }
 }
-foreach ($required in @('LAN_WIFI_SSID       "TP-LINK_184F"',
-                         'LAN_SERVER_URL      "http://192.168.31.183"',
+foreach ($required in @('LAN_WIFI_SSID       LUOYE_CFG_LAN_WIFI_SSID',
+                         'LAN_SERVER_URL      LUOYE_CFG_LAN_SERVER_BASE_URL',
                          'PUBLIC_SERVER_URL   LUOYE_CFG_SERVER_BASE_URL',
+                         'LAN_WIFI_SSID[0] && LAN_SERVER_URL[0]',
                          'server_base_url()',
                          'route=%s server=%s')) {
     if ($network -notmatch [regex]::Escape($required)) {

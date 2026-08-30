@@ -4,12 +4,13 @@ ESP32-S3 + 1.54" 方形墨水屏(GDEY0154D67/SSD1681, 200×200)+ 双 PDM 麦 + m
 
 当前方屏版本说明、按键表和烧录步骤见 [docs/UI154_FIRMWARE.md](docs/UI154_FIRMWARE.md)。
 内部产品名为 **落叶 / Luoye**，ESP-IDF 工程名保留为 `recorder_card`。
-当前固件版本：`1.7.1`，设备协议：`luoye-device-api/2`，配套服务器：ClearMeeting `0.21.0`。
+当前固件版本：`2.0.0`，设备协议：`luoye-device-api/2`，配套服务器：ClearMeeting `2.0.0`（源自 `0.21.0-upload-progress-r9`）。
 V1.5.0 的电量百分比改为 3.180–4.100V 被动电压映射；它只负责显示，不参与充电终止或录音权限判断。详见 [docs/V1_5_0_PASSIVE_BATTERY_DISPLAY.md](docs/V1_5_0_PASSIVE_BATTERY_DISPLAY.md)。
 V1.5.1 调整墨水屏维护节奏：每分钟时间局刷、每10分钟 FAST、每逢整点 FULL，充电页每跨5%执行一次 FAST。详见 [docs/V1_5_1_REFRESH_CADENCE.md](docs/V1_5_1_REFRESH_CADENCE.md)。
 V1.5.2 删除所有人为电量涨跌速度和99%封顶，滤波电压直接映射百分比。详见 [docs/V1_5_2_DIRECT_VOLTAGE_SOC.md](docs/V1_5_2_DIRECT_VOLTAGE_SOC.md)。
 V1.6.0 R2 只修复手动补传再次进入时未立即继续的问题：重新确认同步会解除旧重试等待，并再次依据服务器 `upload-plan` 续传；不增加NVS状态，也不改变10 MiB和底层上传参数。详见 [docs/V1_6_0_MINIMAL_MANUAL_RESUME.md](docs/V1_6_0_MINIMAL_MANUAL_RESUME.md)。
-V1.7.1 在 V1.7.0 R2 的精确长度 SDSPI DMA 与故障隔离基础上，只修复实时录音写入：`audio.wav` 使用无 stdio 缓冲的内部 DMA 对齐4096字节写入块，避免 Wi-Fi 上传压力下 ESP-IDF 为 PSRAM 缓冲临时申请512字节 DMA 并失败。离线上传、16 KiB读取缓冲、10 MiB分段、SHA、断点续传及网络参数保持不变。详见 [docs/V1_7_1_WAV_DMA_WRITE.md](docs/V1_7_1_WAV_DMA_WRITE.md)。
+V1.7.2 固定项目本地 ESP-IDF 5.5.4 `sdmmc` 组件。SDSPI 主机已拥有永久516字节内部 DMA 中转，因此通用读写层不再为 FatFS/PSRAM 缓冲临时申请512字节 DMA；原生 SDMMC 规则不变。实时录音、实时读取和离线上传共用这一根因修复，10 MiB分段、SHA、断点续传及网络参数保持不变。详见 [docs/V1_7_2_SDSPI_OUTER_DMA.md](docs/V1_7_2_SDSPI_OUTER_DMA.md)。
+V2.0.0 是已通过真机稳定验证的 V1.7.2 正式升版，不引入功能或参数变化。它取代早期同号的 live-caption 实验包，作为后续维护基线。详见 [docs/V2_0_0_STABLE_BASELINE.md](docs/V2_0_0_STABLE_BASELINE.md)。
 交互行为以 **250×122 交互模拟器** 为规格书(`ai-recorder-card-sim-index-250x122.html`),
 `main/app_state.c` 是其中状态机的 1:1 C 移植 —— **改交互先改模拟器,确认后两边同步**。
 
@@ -64,11 +65,11 @@ HTTP 由单一网络业务调度器仲裁，SD 录音写入不依赖网络。
 在 ESP-IDF PowerShell 中执行：
 
 ```powershell
-cd D:\LUOYE_PROJECT_HANDOFF_2026-08-19\01_FIRMWARE\maintenance\recorder-card-v1.7.1
+cd <仓库目录>\firmware
 .\tools\run_engineering_checks.ps1 -Profile dev -FullClean
 ```
 
-正式 HTTPS 开发构建（默认连接 `https://clearmeeting.chat`）：
+正式 HTTPS 开发构建（默认连接 `https://meeting.example.invalid`）：
 
 ```powershell
 .\tools\build_profile.ps1 -Profile dev
@@ -79,19 +80,22 @@ cd D:\LUOYE_PROJECT_HANDOFF_2026-08-19\01_FIRMWARE\maintenance\recorder-card-v1.
 
 ```powershell
 .\tools\build_profile.ps1 -Profile dev `
-  -ServerBaseUrl http://192.168.1.100:34567 `
+  -ServerBaseUrl http://192.0.2.10:34567 `
   -AllowInsecureHttp
 ```
 
 `ServerBaseUrl` 只能是无路径、无末尾 `/` 的 `http(s)://host[:port]`。
 `rc` / `release` 构建拒绝 HTTP，并固定使用系统 CA 验证 HTTPS。
 
+公开源码不包含作者的 SSID 或局域网服务器地址。如需在指定 Wi-Fi 下自动切换到局域网服务，
+配置时必须同时传入 `LUOYE_LAN_WIFI_SSID` 和 `LUOYE_LAN_SERVER_BASE_URL`；两项默认均为空。
+
 生成工程烧录包（必须先提交源码并保持 Git 工作树干净）：
 
 ```powershell
 .\tools\run_engineering_checks.ps1 -Profile engineering -FullClean -Package `
-  -ReleaseId luoye-fw-v1.7.1-engineering-wav-dma-r1 `
-  -ServerBaseUrl http://clearmeeting.chat:34567 -AllowInsecureHttp
+  -ReleaseId luoye-fw-v2.0.0-engineering-stable-sdspi-r1 `
+  -ServerBaseUrl https://meeting.example.invalid
 ```
 
 当前正式构建机已使用 ESP-IDF v5.5.4 完成 baseline 干净构建。构建会自动把
@@ -140,7 +144,7 @@ cd D:\LUOYE_PROJECT_HANDOFF_2026-08-19\01_FIRMWARE\maintenance\recorder-card-v1.
 
 ## 已知限制（工程版，量产前必修）
 
-- 固件 v1.0.0 和 ClearMeeting v0.19.2 已统一到 `luoye-device-api/2`；账号隔离、配对、断网补传、
+- 固件 2.0.0 和 ClearMeeting 2.0.0 已统一到 `luoye-device-api/2`；账号隔离、配对、断网补传、
   字幕/翻译、议程和语音待办仍需完成真实设备端到端验收后才能进入量产状态。
 - 设备端只读取服务器给出的同一 revision 原文/译文；不在本地运行 ASR 或翻译模型。
 - PCF8563 闹钟没有月份字段；服务器议程接口应只下发未来 14 天窗口。

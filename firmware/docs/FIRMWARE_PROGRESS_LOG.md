@@ -562,7 +562,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
 - ESP-IDF v5.5.4 增量构建：通过；App 约 1.19 MiB。
 
 **线上服务器核验**：
-- `http://clearmeeting.chat:34567/` 当前 Web 可访问。
+- `http://meeting.example.invalid:34567/` 当前 Web 可访问。
 - `/api/build-info` 返回 404。
 - 当前 Web bundle 只有 auth、meetings、agenda 等接口，没有 device pair/claim。
 - HTTPS 固件入口、Device Token、账号 Claim、解绑和设备列表尚未实现。
@@ -651,7 +651,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
 - 该构建来自未提交工作树，只作为编译证据；发布包必须在 commit 后重新全量构建。
 
 **外部阻塞**：
-- `clearmeeting.chat` 尚未实现 `luoye-device-api/0.3-draft`。
+- `meeting.example.invalid` 尚未实现 `luoye-device-api/0.3-draft`。
 - 当前不能完成 Device Token、账号隔离、服务端去重、断点续传和 final 的端到端验证。
 
 **下一步**：
@@ -717,7 +717,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
 - 该构建来自未提交工作树，只作为编译证据；发布包必须在 commit 后重新全量构建。
 
 **外部阻塞**：
-- `clearmeeting.chat` 尚未实现 `luoye-device-api/0.4-draft`。
+- `meeting.example.invalid` 尚未实现 `luoye-device-api/0.4-draft`。
 - 当前不能验证真实 Device Token、live revision、ASR/翻译、客户端活动会话和账号隔离。
 
 **下一步**：
@@ -797,7 +797,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
   - SHA-256：`76bd51d43add80311c3f9accbad57cedd83717a834cae7724d2fd89a63cb4728`
 
 **限制**：
-- 当前 `clearmeeting.chat` 尚未实现 0.5-draft，真实议程、ASR、时间解析和账号日历写入
+- 当前 `meeting.example.invalid` 尚未实现 0.5-draft，真实议程、ASR、时间解析和账号日历写入
   不能在本版本冻结时做端到端验证。
 - 未烧录、未执行 PCF8563 到点唤醒和语音待办真板专项测试，因此不能标记 `BOARD_PASS`。
 
@@ -810,7 +810,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
 **目标**：把设备端统一到 `luoye-device-api/1`，并冻结可供三端联调的协议实现。
 
 **代码修改**：
-- 服务端地址改为构建期配置；默认 `https://clearmeeting.chat`，明文 HTTP 仅允许
+- 服务端地址改为构建期配置；默认 `https://meeting.example.invalid`，明文 HTTP 仅允许
   `dev/engineering` 显式启用。
 - 完成 build-info 兼容门禁、设备配对 start/status、同账号令牌轮换与结构化配对错误恢复。
 - 完成 session/create、连续分片 ACK、mark、end、state、断网补传和幂等键 v1 契约。
@@ -827,7 +827,7 @@ Git 初始化前的构建产物（历史证据，不能作为发布包）：
 
 **构建**：
 - ESP-IDF：`v5.5.4`，target `esp32s3`，profile `dev`。
-- 服务器 origin：`https://clearmeeting.chat`；`LUOYE_ALLOW_INSECURE_HTTP=OFF`。
+- 服务器 origin：`https://meeting.example.invalid`；`LUOYE_ALLOW_INSECURE_HTTP=OFF`。
 - 全新目录：`build-api-v1-final`。
 - App：1,274,288 B（`0x1371b0`），SHA-256：
   `a43353ef218c27790db17f176a4370654bf22857e13b4224c5dc89205c2adf74`。

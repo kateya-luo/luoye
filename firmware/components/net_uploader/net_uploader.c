@@ -47,8 +47,8 @@
 static const char *TAG = "net";
 
 #define PUBLIC_SERVER_URL   LUOYE_CFG_SERVER_BASE_URL
-#define LAN_WIFI_SSID       "TP-LINK_184F"
-#define LAN_SERVER_URL      "http://192.168.31.183"
+#define LAN_WIFI_SSID       LUOYE_CFG_LAN_WIFI_SSID
+#define LAN_SERVER_URL      LUOYE_CFG_LAN_SERVER_BASE_URL
 #define BUILD_INFO_PATH     "/api/v2/build-info"
 #define PAIR_START_PATH     "/api/v2/device/pair/start"
 #define PAIR_STATUS_PATH    "/api/v2/device/pair/status"
@@ -162,7 +162,8 @@ static void wifi_retry_schedule(void) {
 }
 
 static const char *server_base_url(void) {
-  return s_use_lan_server ? LAN_SERVER_URL : PUBLIC_SERVER_URL;
+  return s_use_lan_server && LAN_SERVER_URL[0]
+           ? LAN_SERVER_URL : PUBLIC_SERVER_URL;
 }
 
 static const char PORTAL_HTML[] =
@@ -3770,7 +3771,8 @@ static void wifi_event(void *argument, esp_event_base_t base, int32_t id, void *
     esp_err_t ap_error = esp_wifi_sta_get_ap_info(&ap);
     const char *fallback_ssid = s_pending_credentials ? s_pending_ssid : s_saved_ssid;
     const char *ssid = ap_error == ESP_OK ? (const char *)ap.ssid : fallback_ssid;
-    s_use_lan_server = strcmp(ssid, LAN_WIFI_SSID) == 0;
+    s_use_lan_server = LAN_WIFI_SSID[0] && LAN_SERVER_URL[0] &&
+                       strcmp(ssid, LAN_WIFI_SSID) == 0;
     ESP_LOGI(TAG,
              "LY|WIFI|ssid=%s ip=" IPSTR " rssi=%d route=%s server=%s",
              ssid, IP2STR(&event->ip_info.ip),
