@@ -24,9 +24,9 @@
 ## 项目预览
 
 <p align="center">
-  <img src="docs/images/product/luoye-recorder-duo.png" alt="两台落叶录音卡工程样机" width="900">
+  <img src="docs/images/product/luoye-recorder-duo.png" alt="两台落叶录音卡工程样机" width="520">
 </p>
-<img width="932" height="800" alt="截图_20261001234019" src="https://github.com/user-attachments/assets/bc2ee546-4725-4d35-9fbf-47618ae645b0" />
+<img width="520"  alt="截图_20261001234019" src="https://github.com/user-attachments/assets/bc2ee546-4725-4d35-9fbf-47618ae645b0" />
 
 | 桌面使用 | 实机操作 |
 | :---: | :---: |
