@@ -24,10 +24,10 @@
 ## 项目预览
 
 
-|<img src="docs/images/product/luoye-recorder-duo.png" alt="两台落叶录音卡工程样机" width="520"> | <img alt="截图_20261001234019" src="https://github.com/user-attachments/assets/bc2ee546-4725-4d35-9fbf-47618ae645b0"  width="520"> |
-
-| 桌面使用 | 实机操作 |
+|  |  |
 | :---: | :---: |
+| <img src="docs/images/product/luoye-recorder-duo.png" alt="两台落叶录音卡工程样机" width="520"> | <img alt="截图_20261001234019" src="https://github.com/user-attachments/assets/bc2ee546-4725-4d35-9fbf-47618ae645b0" width="520"> |
+| **桌面使用** | **实机操作** |
 | <img src="docs/images/product/luoye-recorder-desk.png" alt="落叶录音卡桌面使用场景" width="520"> | <img src="docs/images/product/luoye-recorder-in-hand.jpg" alt="手持操作落叶录音卡" width="520"> |
 
 以上为当前 3D 打印外壳的工程样机实拍。
