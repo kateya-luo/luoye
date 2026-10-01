@@ -1,4 +1,22 @@
 # 落叶（Luoye）录音卡---会议纪要AI录音卡
+
+<!-- split-project-navigation -->
+## 固件与服务器独立入口
+
+落叶是同一个完整项目，固件与服务器通过 `luoye-device-api/2` 配合，分开维护和发布。
+
+| 组件 | 独立入口 | 版本下载 |
+| --- | --- | --- |
+| 录音卡固件、硬件与使用说明 | [固件页面](https://github.com/kateya-luo/luoye/tree/main/firmware) | [固件历史发布](https://github.com/kateya-luo/luoye/releases) |
+| ClearMeeting 服务器与网页 | [服务器项目](https://github.com/kateya-luo/clearmeeting-server) | [V2.1.0 R2](https://github.com/kateya-luo/clearmeeting-server/releases/tag/v2.1.0-r2) |
+
+**最新服务器版本为 V2.1.0 R2。** 本仓库原 `server/` 和旧服务器 Release 保留作历史归档；
+新部署、升级及服务器源码请使用上面的独立服务器项目。
+下方旧兼容基线和固件功能描述对应历史公开版本，不代表新版省电固件的功能。
+本次不发布或替换固件二进制。
+
+<!-- /split-project-navigation -->
+
 起因是我觉得钉TALK太贵了，这么个玩意儿自己做一个得了，结果就是漫长的三个月。
 这也是我第一个全自研（AI助力）的项目，希望您能喜欢。
 落叶是一套以 ESP32-S3、1.54 英寸电子墨水屏、双麦克风和 microSD 为核心的录音卡系统。设备负责可靠录音、离线保存、实时字幕显示与断点补传；ClearMeeting 负责转写、多人识别、会议纪要、待办和网页管理。
